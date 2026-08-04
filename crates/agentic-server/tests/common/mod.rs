@@ -16,6 +16,7 @@ use agentic_server::app::{AppState, ServerConfig, WebSocketTracker, build_router
 pub fn test_config(llm_url: &str) -> Config {
     Config {
         llm_api_base: llm_url.to_owned(),
+        upstream_api: agentic_core::protocol::UpstreamApi::default(),
         openai_api_key: Some("test-key".to_owned()),
         llm_ready_timeout_s: 5.0,
         llm_ready_interval_s: 0.1,

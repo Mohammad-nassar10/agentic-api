@@ -26,6 +26,7 @@ const PROMPT_SIZES: [usize; 3] = [1024, 10 * 1024, 100 * 1024];
 fn bench_config(llm_url: &str) -> Config {
     Config {
         llm_api_base: llm_url.to_owned(),
+        upstream_api: agentic_core::protocol::UpstreamApi::default(),
         openai_api_key: Some("bench-key".to_owned()),
         llm_ready_timeout_s: 5.0,
         llm_ready_interval_s: 0.1,

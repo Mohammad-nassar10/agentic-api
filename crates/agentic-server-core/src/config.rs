@@ -1,3 +1,5 @@
+use crate::protocol::UpstreamApi;
+
 pub const DEFAULT_SQLITE_MAX_CONNECTIONS: u32 = 4;
 pub const DEFAULT_SQLITE_JOURNAL_SIZE_LIMIT_BYTES: u64 = 6_144_000;
 pub const DEFAULT_SQLITE_MMAP_SIZE_BYTES: u64 = 268_435_456;
@@ -43,6 +45,10 @@ impl Default for SqliteConfig {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub llm_api_base: String,
+    /// Wire protocol spoken to the backend at `llm_api_base`. Defaults to the
+    /// Responses API; `ChatCompletions` targets backends that only serve
+    /// `/v1/chat/completions`.
+    pub upstream_api: UpstreamApi,
     pub openai_api_key: Option<String>,
     pub llm_ready_timeout_s: f64,
     pub llm_ready_interval_s: f64,

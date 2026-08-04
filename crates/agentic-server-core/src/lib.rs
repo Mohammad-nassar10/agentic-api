@@ -2,6 +2,7 @@ pub mod config;
 pub mod error;
 pub mod events;
 pub mod executor;
+pub mod protocol;
 pub mod proxy;
 pub mod readiness;
 pub mod storage;
@@ -9,6 +10,7 @@ pub mod tool;
 pub mod types;
 pub mod utils;
 
+pub use protocol::UpstreamApi;
 pub use storage::{
     ConversationData, ConversationStore, DbPool, InOutItem, ItemKind, ResponseData, ResponseMetadata, ResponseStore,
     SchemaManager, StorageError, StoreResult, create_pool, create_pool_with_schema,

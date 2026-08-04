@@ -154,6 +154,7 @@ async fn spawn_gateway(llm_url: &str) -> (Arc<reqwest::Client>, String) {
 
     let config = Config {
         llm_api_base: llm_url.to_owned(),
+        upstream_api: agentic_core::protocol::UpstreamApi::default(),
         openai_api_key: None,
         llm_ready_timeout_s: 5.0,
         llm_ready_interval_s: 0.1,

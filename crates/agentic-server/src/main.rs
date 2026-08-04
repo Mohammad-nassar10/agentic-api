@@ -5,6 +5,7 @@ use agentic_core::config::{
     SqliteConfig, SqliteTempStore, normalize_base_url,
 };
 use agentic_core::error::Error;
+use agentic_core::protocol::UpstreamApi;
 
 mod server;
 
@@ -28,6 +29,12 @@ struct CommonArgs {
     /// Skip the upstream /health readiness probe. Useful for hosted OpenAI-compatible providers.
     #[arg(long, env = "SKIP_LLM_READY_CHECK", default_value_t = false, global = true)]
     skip_llm_ready_check: bool,
+
+    /// Wire protocol spoken to the upstream backend: `responses` (default) or
+    /// `chat_completions` for backends that only serve `/v1/chat/completions`.
+    /// Streaming requires `responses`.
+    #[arg(long, env = "UPSTREAM_API", default_value = "responses", global = true)]
+    upstream_api: UpstreamApi,
 
     /// `SQLite` or `PostgreSQL` URL for conversation and response storage.
     /// Defaults to a local `SQLite` file.
@@ -138,6 +145,7 @@ fn sqlite_config_from_env() -> Result<SqliteConfig, Error> {
 fn build_config(llm_api_base: String, common: &CommonArgs) -> Result<Config, Error> {
     Ok(Config {
         llm_api_base,
+        upstream_api: common.upstream_api,
         openai_api_key: common.openai_api_key.clone(),
         llm_ready_timeout_s: common.llm_ready_timeout_s,
         llm_ready_interval_s: common.llm_ready_interval_s,

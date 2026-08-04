@@ -53,7 +53,11 @@ pub async fn responses(State(state): State<AppState>, req: Request) -> Response 
         Err(e) => return e,
     };
 
-    let should_execute = payload.store
+    // The proxy path forwards the Responses body verbatim, which a Chat
+    // Completions backend rejects. Under that upstream every request must go
+    // through the executor so the protocol adapter runs.
+    let should_execute = state.exec_ctx.upstream_api.is_chat_completions()
+        || payload.store
         || payload.previous_response_id.is_some()
         || payload.conversation_id.is_some()
         || payload.input.contains_compaction()

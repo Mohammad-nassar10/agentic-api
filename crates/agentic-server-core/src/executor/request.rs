@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use crate::config::Config;
 use crate::error::Error;
+use crate::protocol::UpstreamApi;
 use crate::executor::modes::{ConversationHandler, ResponseHandler};
 use crate::storage::{ConversationStore, ResponseStore, create_pool_with_schema_and_sqlite_config};
 use crate::tool::{GatewayExecutor, GatewayExecutors};
@@ -59,6 +60,9 @@ pub struct ExecutionContext {
     pub messages_gateway_tools: GatewayToolMap,
     /// Base URL for the LLM backend, e.g. `"http://localhost:8000"`.
     pub llm_base_url: String,
+    /// Wire protocol spoken to that backend. Selects the inference path and
+    /// whether request/response translation is applied.
+    pub upstream_api: UpstreamApi,
     /// Maximum wait time for the next SSE chunk.  `Duration::ZERO` disables the timeout.
     /// Sourced from [`Config::streaming_chunk_timeout_s`](crate::config::Config::streaming_chunk_timeout_s).
     pub streaming_timeout: Duration,
@@ -69,6 +73,15 @@ impl ExecutionContext {
     #[must_use]
     pub fn responses_url(&self) -> String {
         format!("{}/v1/responses", self.llm_base_url)
+    }
+
+    /// Returns the full URL for inference calls, honouring [`Self::upstream_api`].
+    ///
+    /// Prefer this over [`Self::responses_url`] for anything that goes through
+    /// the protocol adapters.
+    #[must_use]
+    pub fn inference_url(&self) -> String {
+        format!("{}{}", self.llm_base_url, self.upstream_api.inference_path())
     }
 
     /// Returns the full URL for the `/v1/conversations` endpoint.
@@ -92,6 +105,7 @@ impl ExecutionContext {
             gateway_executors,
             messages_gateway_tools: messages_gateway_tools_from_env(),
             llm_base_url,
+            upstream_api: UpstreamApi::default(),
             streaming_timeout: Duration::from_secs(30),
         }
     }
@@ -99,6 +113,13 @@ impl ExecutionContext {
     #[must_use]
     pub fn with_gateway_executor(mut self, executor: Arc<dyn GatewayExecutor>) -> Self {
         self.gateway_executors.insert(executor);
+        self
+    }
+
+    /// Override the upstream wire protocol.
+    #[must_use]
+    pub fn with_upstream_api(mut self, upstream_api: UpstreamApi) -> Self {
+        self.upstream_api = upstream_api;
         self
     }
 
@@ -129,6 +150,7 @@ impl ExecutionContext {
             gateway_executors,
             messages_gateway_tools: messages_gateway_tools_from_env(),
             llm_base_url: cfg.llm_api_base.clone(),
+            upstream_api: cfg.upstream_api,
             streaming_timeout: Duration::from_secs(30),
         })
     }

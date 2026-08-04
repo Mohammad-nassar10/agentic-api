@@ -312,6 +312,7 @@ mod tests {
     fn test_config() -> Config {
         Config {
             llm_api_base: "http://localhost:8000".to_owned(),
+            upstream_api: crate::protocol::UpstreamApi::default(),
             openai_api_key: Some("test-key".to_owned()),
             llm_ready_timeout_s: 5.0,
             llm_ready_interval_s: 0.1,

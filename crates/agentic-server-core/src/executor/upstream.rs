@@ -10,6 +10,7 @@ use crate::executor::error::{ExecutorError, ExecutorResult};
 use crate::executor::gateway_accumulator::{GatewayStreamAccumulator, StreamEvent, emit_sse_frame};
 use crate::executor::inference::{call_inference, fetch_response_json};
 use crate::executor::request::{ExecutionContext, RequestContext};
+use crate::protocol::{UpstreamApi, chat};
 use crate::tool::ToolRegistry;
 use crate::types::request_response::ResponsePayload;
 use crate::utils::common::serialize_to_string;
@@ -32,12 +33,24 @@ pub(super) async fn fetch_blocking_payload(
     exec_ctx: &ExecutionContext,
     auth: Option<&str>,
 ) -> ExecutorResult<ResponsePayload> {
-    let url = exec_ctx.responses_url();
+    let url = exec_ctx.inference_url();
     // Non-streaming request: stream=false -> full JSON body -> from_json.
-    let upstream_request = ctx.enriched_request.to_upstream_request(false)?;
-    let upstream_json = serialize_to_string(&upstream_request).map_err(ExecutorError::JsonError)?;
+    let upstream_json = match exec_ctx.upstream_api {
+        UpstreamApi::Responses => {
+            let upstream_request = ctx.enriched_request.to_upstream_request(false)?;
+            serialize_to_string(&upstream_request).map_err(ExecutorError::JsonError)?
+        }
+        UpstreamApi::ChatCompletions => chat::request_json(&ctx.enriched_request, false)?,
+    };
 
     let body = fetch_response_json(upstream_json, &url, &exec_ctx.client, auth).await?;
+
+    // Translate back into the Responses shape so the accumulator — and
+    // everything downstream of it — stays protocol-agnostic.
+    let body = match exec_ctx.upstream_api {
+        UpstreamApi::Responses => body,
+        UpstreamApi::ChatCompletions => chat::response_to_responses_json(&body)?,
+    };
 
     let acc = ResponseAccumulator::from_json(&body, ctx.conversation_id.as_deref())?;
     let mut payload = acc.finalize(
@@ -61,6 +74,15 @@ pub(super) async fn fetch_stream_payload(
     )>,
     output_offset: usize,
 ) -> ExecutorResult<StreamPayload> {
+    // Chat Completions streams `chat.completion.chunk` deltas, which carry none
+    // of the response/item envelope the accumulator below consumes. Reject it
+    // outright rather than emitting a silently truncated stream.
+    if exec_ctx.upstream_api.is_chat_completions() {
+        return Err(ExecutorError::InvalidRequest(
+            "streaming is not supported when the upstream API is 'chat_completions'".to_owned(),
+        ));
+    }
+
     let url = exec_ctx.responses_url();
     let upstream_request = ctx.enriched_request.to_upstream_request(true)?;
     let upstream_json = serialize_to_string(&upstream_request).map_err(ExecutorError::JsonError)?;
