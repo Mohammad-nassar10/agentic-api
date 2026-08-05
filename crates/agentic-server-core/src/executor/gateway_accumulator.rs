@@ -4,6 +4,7 @@ use crate::types::request_response::ResponsePayload;
 use crate::utils::common::{serialize_to_string, serialize_to_value};
 use serde_json::Value;
 
+#[derive(Clone)]
 pub struct GatewayStreamAccumulator {
     next_sequence_number: u64,
     emitted_created: bool,
@@ -50,10 +51,11 @@ impl GatewayStreamAccumulator {
         serialize_sse_frame(&frame)
     }
 
-    pub(crate) fn error_chunk(&mut self, message: &str) -> String {
-        let mut frame = error_frame(message);
+    pub(crate) fn executor_error_chunk(&mut self, error: &ExecutorError) -> String {
+        let mut frame = executor_error_frame(error);
         self.stamp_event(&mut frame, 0);
-        serialize_sse_frame(&frame).unwrap_or_else(|_| error_sse_chunk(message, frame.sequence_number().unwrap_or(0)))
+        serialize_sse_frame(&frame)
+            .unwrap_or_else(|_| error_sse_chunk(&error.to_string(), frame.sequence_number().unwrap_or(0)))
     }
 
     fn should_emit_lifecycle(&mut self, event_type: SSEEventType) -> bool {
@@ -111,14 +113,21 @@ fn terminal_response_frame(payload: &ResponsePayload) -> ExecutorResult<EventFra
         .ok_or_else(|| ExecutorError::StreamError("terminal response event has no wire representation".to_owned()))
 }
 
-fn error_frame(message: &str) -> EventFrame {
+fn executor_error_frame(error: &ExecutorError) -> EventFrame {
+    let error_type = error.error_type();
+    let code = error.error_code();
     let mut wire = WireEvent::new("error");
-    wire.rest.insert(
-        "error".to_owned(),
-        serde_json::json!({
-            "message": message,
-        }),
-    );
+    wire.rest
+        .insert("status".to_owned(), serde_json::json!(error.http_status().as_u16()));
+    let mut error_details = serde_json::Map::new();
+    error_details.insert("message".to_owned(), serde_json::json!(error.error_message()));
+    error_details.insert("type".to_owned(), serde_json::json!(error_type));
+    error_details.insert("code".to_owned(), serde_json::json!(code));
+    if let Some(param) = error.error_param() {
+        error_details.insert("param".to_owned(), serde_json::json!(param));
+    }
+    wire.rest
+        .insert("error".to_owned(), serde_json::Value::Object(error_details));
     EventFrame {
         event_type: SSEEventType::Other,
         payload: EventPayload::None,
@@ -127,10 +136,26 @@ fn error_frame(message: &str) -> EventFrame {
 }
 
 pub(super) fn error_sse_chunk(message: &str, sequence_number: u64) -> String {
-    let mut frame = error_frame(message);
-    frame.wire.sequence_number = Some(sequence_number);
-    serialize_sse_frame(&frame)
-        .unwrap_or_else(|_| format!("data: {{\"type\":\"error\",\"sequence_number\":{sequence_number}}}\n\n"))
+    let code = "server_error";
+    let mut wire = WireEvent::new("error");
+    wire.sequence_number = Some(sequence_number);
+    wire.rest.insert("status".to_owned(), serde_json::json!(500));
+    wire.rest.insert(
+        "error".to_owned(),
+        serde_json::json!({
+            "message": message,
+            "type": code,
+            "code": code,
+        }),
+    );
+    let frame = EventFrame {
+        event_type: SSEEventType::Other,
+        payload: EventPayload::None,
+        wire,
+    };
+    serialize_sse_frame(&frame).unwrap_or_else(|_| {
+        format!("data: {{\"type\":\"error\",\"status\":500,\"sequence_number\":{sequence_number}}}\n\n")
+    })
 }
 
 pub(super) fn synthetic_event(
@@ -164,6 +189,7 @@ fn serialize_sse_frame(frame: &EventFrame) -> ExecutorResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::StorageError;
 
     #[test]
     fn process_sse_line_numbers_and_rebases_output_index() {
@@ -193,6 +219,34 @@ mod tests {
         assert_eq!(event["type"], "error");
         assert_eq!(event["sequence_number"], 7);
         assert_eq!(event["error"]["message"], "task failed: \"unexpected\"\nretry");
+    }
+
+    #[test]
+    fn executor_conflict_sse_chunk_uses_client_conflict_contract() {
+        let mut accumulator = GatewayStreamAccumulator::new();
+        let error = ExecutorError::Persistence(Box::new(ExecutorError::ConversationLocked {
+            source: StorageError::ConversationConflict {
+                conversation_id: "conv_test".to_owned(),
+            },
+        }));
+        let chunk = accumulator.executor_error_chunk(&error);
+        let data = chunk
+            .trim_end_matches('\n')
+            .strip_prefix("data: ")
+            .expect("SSE data prefix");
+        let event: serde_json::Value = serde_json::from_str(data).expect("valid error event JSON");
+
+        assert_eq!(event["type"], "error");
+        assert_eq!(event["status"], 400);
+        assert_eq!(
+            event["error"],
+            serde_json::json!({
+                "message": "conversation changed while the response was being generated; retry the request",
+                "type": "invalid_request_error",
+                "code": "conversation_locked",
+                "param": "conversation"
+            })
+        );
     }
 
     #[test]
