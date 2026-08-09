@@ -16,7 +16,8 @@ use agentic_core::proxy::ProxyState;
 
 use crate::auth::{ANTHROPIC_COUNT_TOKENS_PATH, ANTHROPIC_MESSAGES_PATH, OidcAuthenticator, require_oidc};
 use crate::handler::{
-    compact_response, conversations, count_tokens, health, messages, models, ready, responses, responses_ws_with_auth,
+    chat_completions, compact_response, conversations, count_tokens, health, messages, models, ready, responses,
+    responses_ws_with_auth,
 };
 
 #[derive(Clone, Default)]
@@ -233,6 +234,9 @@ pub struct AppState {
     /// Server-configured API key; used as fallback when the request carries no
     /// `Authorization` header on the executor path.
     pub openai_api_key: Option<String>,
+    /// Endpoint of the context compaction service. `None` disables compaction,
+    /// leaving stored session prefixes as the unmodified history.
+    pub compaction_address: Option<String>,
 }
 
 pub fn build_router(state: AppState, server_config: &ServerConfig) -> Router {
@@ -246,6 +250,7 @@ pub fn build_router_with_auth(
 ) -> Router {
     let public_routes = Router::new().route("/health", get(health)).route("/ready", get(ready));
     let protected_routes = Router::new()
+        .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/conversations", post(conversations))
         .route("/v1/models", get(models))
         .route(ANTHROPIC_MESSAGES_PATH, post(messages))

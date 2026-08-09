@@ -127,6 +127,18 @@ impl ExecutionContext {
         self.storage_pool.as_deref()
     }
 
+    /// Store for per-session prompt prefixes, sharing this context's pool.
+    ///
+    /// Returns a disabled store when persistence is not configured, so callers
+    /// can treat "no database" as "no stored prefix" rather than an error.
+    #[must_use]
+    pub fn session_prefix_store(&self) -> crate::storage::SessionPrefixStore {
+        self.storage_pool.as_ref().map_or_else(
+            crate::storage::SessionPrefixStore::disabled,
+            |pool| crate::storage::SessionPrefixStore::new(Arc::clone(pool)),
+        )
+    }
+
     /// Build an `ExecutionContext` directly from [`Config`](crate::config::Config).
     ///
     /// Creates the database pool, both storage handlers, and an HTTP client
