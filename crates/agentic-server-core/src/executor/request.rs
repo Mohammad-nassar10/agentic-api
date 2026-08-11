@@ -133,10 +133,11 @@ impl ExecutionContext {
     /// can treat "no database" as "no stored prefix" rather than an error.
     #[must_use]
     pub fn session_prefix_store(&self) -> crate::storage::SessionPrefixStore {
-        self.storage_pool.as_ref().map_or_else(
-            crate::storage::SessionPrefixStore::disabled,
-            |pool| crate::storage::SessionPrefixStore::new(Arc::clone(pool)),
-        )
+        self.storage_pool
+            .as_ref()
+            .map_or_else(crate::storage::SessionPrefixStore::disabled, |pool| {
+                crate::storage::SessionPrefixStore::new(Arc::clone(pool))
+            })
     }
 
     /// Build an `ExecutionContext` directly from [`Config`](crate::config::Config).

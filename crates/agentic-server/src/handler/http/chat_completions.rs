@@ -15,11 +15,12 @@ use http::HeaderMap;
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
-use agentic_core::proxy::{ProxyAuth, ProxyBody, ProxyRequest, proxy_request_with_path};
+use agentic_core::proxy::{ProxyAuth, ProxyRequest, proxy_request_with_path};
 
 use super::super::common::{convert_response, read_bytes};
 use crate::app::AppState;
 use crate::compaction;
+use crate::pool_signals::PoolSignals;
 
 /// Matches the default key of llm-d's session-affinity scorer, so one value
 /// serves both this prefix store and upstream endpoint stickiness.
@@ -46,20 +47,24 @@ pub async fn chat_completions(State(state): State<AppState>, req: Request) -> Re
         }
     }
 
-    // `reply_body` is None for a streamed response, so streaming requests
-    // substitute but never fold — the reply only exists as SSE chunks.
-    let (response, reply_body) = forward(&state, parts.headers, parts.uri.query(), upstream).await;
+    let (response, upstream_ok) = forward(&state, parts.headers, parts.uri.query(), upstream).await;
 
-    let (Some(session), Some(request), Some(messages), Some(reply_body)) = (session, request, messages, reply_body)
-    else {
+    // Only messages the client actually sent are folded. The assistant reply is
+    // deliberately excluded: the client's copy of it may differ from ours, and
+    // it arrives in the next turn's prompt anyway, where the next fold covers it.
+    let (Some(session), Some(request), Some(messages)) = (session, request, messages) else {
         return response;
     };
-    let Some(reply) = assistant_message(&reply_body) else {
-        debug!("no assistant message in reply for {session}: skipping fold");
+    if !upstream_ok {
         return response;
-    };
+    }
 
-    spawn_fold(&state, session, request["model"].as_str().unwrap_or_default().to_owned(), messages, reply);
+    spawn_fold(
+        &state,
+        session,
+        request["model"].as_str().unwrap_or_default().to_owned(),
+        messages,
+    );
     response
 }
 
@@ -113,13 +118,12 @@ async fn substitute(state: &AppState, session: &str, request: &Value, messages: 
     serde_json::to_vec(&body).ok().map(Bytes::from)
 }
 
-/// Forward upstream, also returning the reply body when it was read in full.
-async fn forward(
-    state: &AppState,
-    headers: HeaderMap,
-    query: Option<&str>,
-    body: Bytes,
-) -> (Response, Option<Bytes>) {
+/// Forward upstream, reporting whether the call succeeded.
+///
+/// Any llm-d load signals on the response are logged on the way through. They do
+/// not influence folding yet; the aim is to see real numbers under real traffic
+/// before deciding what pressure is worth folding on.
+async fn forward(state: &AppState, headers: HeaderMap, query: Option<&str>, body: Bytes) -> (Response, bool) {
     let request = ProxyRequest {
         headers,
         body,
@@ -127,24 +131,25 @@ async fn forward(
     };
     let proxied = proxy_request_with_path(request, UPSTREAM_PATH, ProxyAuth::OpenAiBearer, &state.proxy_state).await;
 
-    let reply = match &proxied.body {
-        ProxyBody::Full(bytes) if proxied.status.is_success() => Some(bytes.clone()),
-        _ => None,
-    };
-    (convert_response(proxied), reply)
-}
+    if let Some(signals) = PoolSignals::from_headers(&proxied.headers) {
+        info!(
+            kv_cache_utilization = ?signals.kv_cache_utilization,
+            waiting_queue = ?signals.waiting_queue,
+            running_requests = ?signals.running_requests,
+            age_ms = ?signals.age.map(|age| age.as_millis()),
+            "llm-d pool signals"
+        );
+    }
 
-fn assistant_message(reply: &Bytes) -> Option<Value> {
-    let body: Value = serde_json::from_slice(reply).ok()?;
-    body["choices"].as_array()?.first()?.get("message").cloned()
+    let ok = proxied.status.is_success();
+    (convert_response(proxied), ok)
 }
 
 /// Fold this turn into the session's prefix, off the request path.
 ///
 /// With no compaction service configured — or when it fails — the history is
 /// stored unchanged, which costs compression but never correctness.
-fn spawn_fold(state: &AppState, session: String, model: String, mut messages: Vec<Value>, reply: Value) {
-    messages.push(reply);
+fn spawn_fold(state: &AppState, session: String, model: String, messages: Vec<Value>) {
     let store = state.exec_ctx.session_prefix_store();
     let client = std::sync::Arc::clone(&state.exec_ctx.client);
     let address = state.compaction_address.clone();
