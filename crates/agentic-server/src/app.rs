@@ -237,6 +237,9 @@ pub struct AppState {
     /// Endpoint of the context compaction service. `None` disables compaction,
     /// leaving stored session prefixes as the unmodified history.
     pub compaction_address: Option<String>,
+    /// Backend load at which a session is worth compacting. Empty means compact
+    /// on every turn.
+    pub compaction_thresholds: crate::pool_signals::Thresholds,
 }
 
 pub fn build_router(state: AppState, server_config: &ServerConfig) -> Router {

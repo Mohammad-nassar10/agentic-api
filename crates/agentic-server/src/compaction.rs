@@ -34,12 +34,7 @@ pub fn address_from_env() -> Option<String> {
 /// Returns `None` when the service is unreachable, answers with a non-success
 /// status, or returns a body without a usable `messages` array. Callers treat
 /// that as "store the history unchanged".
-pub async fn compact(
-    address: &str,
-    client: &reqwest::Client,
-    model: &str,
-    messages: &[Value],
-) -> Option<Vec<Value>> {
+pub async fn compact(address: &str, client: &reqwest::Client, model: &str, messages: &[Value]) -> Option<Vec<Value>> {
     // Encoded by hand rather than with `RequestBuilder::json`: reqwest's `json`
     // feature is only a dev-dependency here, so using it would compile under
     // `--all-targets` and fail the real `cargo build -p agentic-server`.

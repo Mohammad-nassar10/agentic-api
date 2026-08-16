@@ -359,17 +359,38 @@ kubectl get gateway inference-gateway -n "$NS" \
 
 ## 6. context-guru
 
-The compactor. It ships three configs; the demo uses **toon**, which is
+The compactor. Three modes are available; the demo uses **toon**, which is
 deterministic and needs no LLM of its own.
 
-| config | what it does | needs an LLM |
-|---|---|---|
-| `toon.yaml` | re-encodes uniform JSON arrays as TOON | no |
-| `extract-code.yaml` | LLM writes a filter that deletes irrelevant lines | yes |
-| `summarize.yaml` | LLM summarises the middle of a transcript | yes |
+| mode | what it does | needs an LLM | changes message count |
+|---|---|---|---|
+| `toon` | re-encodes uniform JSON arrays in `tool` messages as TOON | no | no |
+| `extract` | LLM writes a filter that deletes irrelevant lines | yes | no |
+| `summarize` | LLM compresses the middle of a transcript | yes | **yes** |
+
+> The image contains **no** configs and no `/app/configs` directory — supply them
+> yourself. The mode comes from the container's `--config` flag; a `CONFIG`
+> environment variable is ignored, because the image's own command line wins.
 
 ```bash
 cat <<'YAML' | kubectl apply -n "$NS" -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: context-guru-config
+data:
+  toon.yaml: |
+    # Deterministic: re-encodes uniform JSON arrays in tool messages as TOON —
+    # field names once, then one row per element. No LLM, nothing stored.
+    pipeline: [format, toon]
+    components:
+      format:
+        min_tokens: 50
+      toon:
+        min_tokens: 50
+    store:
+      enabled: false
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -383,8 +404,13 @@ spec:
       containers:
       - name: context-guru
         image: ghcr.io/ronenkat/context-guru-proxy
-        env: [{name: CONFIG, value: /app/configs/toon.yaml}]
+        # The mode comes from this flag. A CONFIG env var is ignored — the
+        # image's own command line always wins.
+        args: ["--config", "/app/configs/toon.yaml"]
         ports: [{containerPort: 4000, name: http}]
+        volumeMounts: [{name: config, mountPath: /app/configs, readOnly: true}]
+      volumes:
+      - {name: config, configMap: {name: context-guru-config}}
 ---
 apiVersion: v1
 kind: Service
@@ -416,6 +442,119 @@ Expected — field names once, then one row each:
 > messages; arrays in user messages pass through untouched. And below roughly ten
 > records the TOON header costs more than it saves, so small payloads can come
 > back *larger*. Use a 20+ record array in demos.
+
+### Switching to an LLM-backed mode
+
+Add the config to the ConfigMap and repoint the flag — the mode is chosen by the
+container's `args`, not by an environment variable:
+
+```bash
+kubectl patch deploy/context-guru -n "$NS" --type=json -p \
+  '[{"op":"replace","path":"/spec/template/spec/containers/0/args",
+     "value":["--config","/app/configs/summarize.yaml"]}]'
+```
+
+A `summarize.yaml` to add under the ConfigMap's `data:`:
+
+```yaml
+  summarize.yaml: |
+    pipeline: [summarize]
+    components:
+      summarize:
+        summary_level: concise
+        keep_last: 1
+        min_tokens: 50
+        resummarize_tokens: 6000
+        marker_mode: "off"
+        trigger:
+          min_messages: 2            # defaults are 12 / 40000 — far too high
+          min_request_tokens: 100    # for a demo-sized conversation
+        model:
+          source: config
+          provider: openai
+          base_url: http://llm-d-coordinator:8080   # NO trailing /v1
+          model: Qwen/Qwen3-8B
+          api_key: "dummy"
+    store:
+      enabled: false
+```
+
+### Two settings that silently produce nothing if wrong
+
+**`base_url` must not end in `/v1`.** context-guru appends the full
+`/v1/chat/completions` itself. With a trailing `/v1` the request goes to
+`/v1/v1/chat/completions`, matches no route, and the compactor returns the input
+unchanged in a few hundred milliseconds — no error anywhere. The tell is the
+coordinator log staying silent: a working call adds `sending request` lines
+there and takes seconds, not milliseconds.
+
+**Reasoning models must have thinking disabled**, or summarization can never
+help. Qwen3 emits a `<think>` block before its answer; asked to summarize a
+52-token input it produced 400 completion tokens of reasoning and hit the cap.
+The "summary" is then longer than the text it would replace, so context-guru
+discards it — correctly, but it looks like a broken compactor. Set the default
+server-side, **on both workers**, since a chat template that differs between
+prefill and decode breaks P/D:
+
+```bash
+for D in vllm-p vllm-d; do
+  kubectl patch deploy/$D -n "$NS" --type=json -p \
+    "[{\"op\":\"add\",\"path\":\"/spec/template/spec/containers/0/args/-\",
+       \"value\":\"--default-chat-template-kwargs={\\\"enable_thinking\\\": false}\"}]"
+done
+kubectl rollout status deploy/vllm-p -n "$NS" --timeout=900s
+kubectl rollout status deploy/vllm-d -n "$NS" --timeout=900s
+```
+
+Measured effect on the same prompt: **400 completion tokens → 41**, and
+compaction latency **14.3s → 1.1s**.
+
+### Reading context-guru's log
+
+Every call logs one line, and `reverted` is the field that matters:
+
+```
+component=summarize tokens.before=407 tokens.after=161 tokens.saved=246 reverted=false   ← applied
+component=summarize tokens.before=407 tokens.after=407 tokens.saved=0   reverted=true    ← declined
+```
+
+`reverted=true` means it ran but the result was not smaller, so it kept the
+original. That is correct behaviour, not a failure — but it means something
+upstream needs fixing: usually thinking left enabled, or a payload too small for
+a summary to win. A `duration_ms` in single digits with `reverted=true` means the
+model was never called at all: check `base_url` and the triggers.
+
+### Three things to weigh first
+
+- **Point it at the coordinator, not agentic-api.** Nothing in that chain sets
+  `x-llm-d-optimization`, so the coordinator's own inline-compaction step stays
+  inert and there is no loop. The gateway cannot be used directly — its
+  HTTPRoute only matches on `EPP-Phase`, so an unlabelled request 404s.
+- **Lower the triggers or nothing fires.** The shipped defaults assume 20k–40k
+  token payloads; a demo conversation is skipped silently and returned unchanged,
+  which looks exactly like a broken deployment.
+- **It competes with serving.** Compaction runs on the same model and GPUs as
+  inference, and with compaction thresholds configured it fires precisely when
+  the pool is already saturated. A small dedicated model avoids this; the
+  shipped configs default to `gpt-4o-mini` for that reason.
+
+Folding also becomes slow enough to miss its window: it runs after the reply, so
+if the next turn arrives first there is no stored prefix to substitute and the
+saving silently doesn't happen. Allow more time between turns than the demo's 3s.
+
+### Measured
+
+An 11-message conversation, via agentic-api with the summarize mode configured
+as above:
+
+```
+folded session prefix      replaced=11 stored=3
+substituted stored prefix  replaced=11 upstream_messages=5 client_messages=13
+```
+
+215 prompt tokens with the session header against 508 without — **58%**. Unlike
+toon, `stored` is lower than `replaced`: the summarizer collapses messages rather
+than only shrinking them.
 
 ---
 

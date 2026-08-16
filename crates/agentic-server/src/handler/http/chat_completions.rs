@@ -20,7 +20,7 @@ use agentic_core::proxy::{ProxyAuth, ProxyRequest, proxy_request_with_path};
 use super::super::common::{convert_response, read_bytes};
 use crate::app::AppState;
 use crate::compaction;
-use crate::pool_signals::PoolSignals;
+use crate::pool_signals::{self, PoolSignals};
 
 /// Matches the default key of llm-d's session-affinity scorer, so one value
 /// serves both this prefix store and upstream endpoint stickiness.
@@ -47,7 +47,7 @@ pub async fn chat_completions(State(state): State<AppState>, req: Request) -> Re
         }
     }
 
-    let (response, upstream_ok) = forward(&state, parts.headers, parts.uri.query(), upstream).await;
+    let (response, upstream_ok, signals) = forward(&state, parts.headers, parts.uri.query(), upstream).await;
 
     // Only messages the client actually sent are folded. The assistant reply is
     // deliberately excluded: the client's copy of it may differ from ours, and
@@ -56,6 +56,10 @@ pub async fn chat_completions(State(state): State<AppState>, req: Request) -> Re
         return response;
     };
     if !upstream_ok {
+        return response;
+    }
+    if !pool_signals::should_compact(&state.compaction_thresholds, signals.as_ref()) {
+        debug!("backend below every configured threshold: not folding {session}");
         return response;
     }
 
@@ -118,12 +122,17 @@ async fn substitute(state: &AppState, session: &str, request: &Value, messages: 
     serde_json::to_vec(&body).ok().map(Bytes::from)
 }
 
-/// Forward upstream, reporting whether the call succeeded.
+/// Forward upstream, reporting whether the call succeeded and any load the
+/// serving endpoint reported.
 ///
-/// Any llm-d load signals on the response are logged on the way through. They do
-/// not influence folding yet; the aim is to see real numbers under real traffic
-/// before deciding what pressure is worth folding on.
-async fn forward(state: &AppState, headers: HeaderMap, query: Option<&str>, body: Bytes) -> (Response, bool) {
+/// The signals are logged whether or not thresholds are configured, so the
+/// numbers a threshold would be chosen from are visible under real traffic.
+async fn forward(
+    state: &AppState,
+    headers: HeaderMap,
+    query: Option<&str>,
+    body: Bytes,
+) -> (Response, bool, Option<PoolSignals>) {
     let request = ProxyRequest {
         headers,
         body,
@@ -131,7 +140,8 @@ async fn forward(state: &AppState, headers: HeaderMap, query: Option<&str>, body
     };
     let proxied = proxy_request_with_path(request, UPSTREAM_PATH, ProxyAuth::OpenAiBearer, &state.proxy_state).await;
 
-    if let Some(signals) = PoolSignals::from_headers(&proxied.headers) {
+    let signals = PoolSignals::from_headers(&proxied.headers);
+    if let Some(signals) = &signals {
         info!(
             kv_cache_utilization = ?signals.kv_cache_utilization,
             waiting_queue = ?signals.waiting_queue,
@@ -142,7 +152,7 @@ async fn forward(state: &AppState, headers: HeaderMap, query: Option<&str>, body
     }
 
     let ok = proxied.status.is_success();
-    (convert_response(proxied), ok)
+    (convert_response(proxied), ok, signals)
 }
 
 /// Fold this turn into the session's prefix, off the request path.

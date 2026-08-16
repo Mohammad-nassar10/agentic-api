@@ -50,6 +50,7 @@ pub fn test_state(config: &Config) -> AppState {
         skip_llm_ready_check: config.skip_llm_ready_check,
         openai_api_key: config.openai_api_key.clone(),
         compaction_address: None,
+        compaction_thresholds: agentic_server::pool_signals::Thresholds::default(),
     }
 }
 
