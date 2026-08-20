@@ -122,6 +122,47 @@ Your exact numbers will vary with the compactor mode currently configured
 
 ---
 
+## 3b. Demo: a scripted client (easier)
+
+Hand-writing each turn gets tedious, and two turns barely shows the effect.
+[`demo_agent.py`](demo_agent.py) behaves like a real client — it keeps the
+conversation, appends each reply, and resends the whole history every turn. It
+runs two identical conversations side by side, one with the session header and
+one without, and prints both token counts.
+
+Standard library only, no dependencies:
+
+```bash
+python3 demo_agent.py --turns 5
+```
+
+```
+turn   with session    control    saved
+----  -------------  ---------  -------
+   1             21         21     0.0%
+   2             77         77     0.0%
+   3            135        135     0.0%
+   4            179        193     7.3%
+   5            215        249    13.7%
+```
+
+Both columns send byte-identical requests; the only difference is the
+`x-session-id` header on the first.
+
+The early turns match because the compactor has a minimum size below which it
+does nothing — there is not yet enough history to be worth compacting. Once it
+starts, the two columns diverge and keep diverging, which is the point: the
+control grows without bound, the compacted one does not.
+
+Useful flags:
+
+| flag | why |
+|---|---|
+| `--turns 10` | longer run, wider gap |
+| `--payload tool` | sends a 20-row JSON array in a `tool` message — use when the compactor is in `toon` mode |
+| `--settle 20` | wait longer between turns if folds are not landing in time |
+| `--api ...` | point at a different deployment |
+
 ## 4. Demo: the backend load headers
 
 Every response carries the serving endpoint's live metrics, added by an llm-d
