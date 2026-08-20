@@ -16,7 +16,8 @@ use agentic_core::proxy::ProxyState;
 
 use crate::auth::{ANTHROPIC_COUNT_TOKENS_PATH, ANTHROPIC_MESSAGES_PATH, OidcAuthenticator, require_oidc};
 use crate::handler::{
-    compact_response, conversations, count_tokens, health, messages, models, ready, responses, responses_ws_with_auth,
+    compact_response, conversations, count_tokens, health, internal_hydrate, internal_persist, messages, models, ready,
+    responses, responses_ws_with_auth,
 };
 
 #[derive(Clone, Default)]
@@ -245,6 +246,13 @@ pub fn build_router_with_auth(
     authenticator: Option<OidcAuthenticator>,
 ) -> Router {
     let public_routes = Router::new().route("/health", get(health)).route("/ready", get(ready));
+    // Split-execution endpoints for a trusted in-cluster orchestrator (e.g.
+    // the llm-d coordinator). Kept outside the OIDC layer — the orchestrator
+    // carries no client credentials — so they must not be exposed on a public
+    // route (restrict them at the network layer).
+    let internal_routes = Router::new()
+        .route("/internal/hydrate", post(internal_hydrate))
+        .route("/internal/persist", post(internal_persist));
     let protected_routes = Router::new()
         .route("/v1/conversations", post(conversations))
         .route("/v1/models", get(models))
@@ -260,6 +268,7 @@ pub fn build_router_with_auth(
     };
 
     public_routes
+        .merge(internal_routes)
         .merge(protected_routes)
         .layer(server_config.cors_layer())
         .with_state(state)
