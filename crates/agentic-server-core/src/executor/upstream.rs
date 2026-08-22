@@ -44,14 +44,24 @@ pub(super) async fn fetch_blocking_payload(
 
     let body = fetch_response_json(upstream_json, &url, &exec_ctx.client, auth).await?;
 
-    let acc = ResponseAccumulator::from_json(&body, ctx.conversation_id.as_deref())?;
+    payload_from_upstream_body(ctx, &body)
+}
+
+/// Assembles the final [`ResponsePayload`] from a complete (non-streaming)
+/// upstream body: parse it, fill in the request-derived fields, and stamp our
+/// own ids over the upstream's. Shared with the split-execution path, which
+/// receives the body from an external orchestrator instead of fetching it.
+///
+/// # Errors
+/// Returns [`ExecutorError::ParseError`] if the body is not a valid response.
+pub(super) fn payload_from_upstream_body(ctx: &RequestContext, body: &str) -> ExecutorResult<ResponsePayload> {
+    let acc = ResponseAccumulator::from_json(body, ctx.conversation_id.as_deref())?;
     let mut payload = acc.finalize(
         &ctx.enriched_request.model,
         ctx.original_request.previous_response_id.as_deref(),
         ctx.original_request.instructions.as_deref(),
     );
     ctx.inject_ids(&mut payload);
-
     Ok(payload)
 }
 

@@ -6,8 +6,9 @@
 //! context and the response to [`persist`].
 //!
 //! This module is a re-composition, not a reimplementation: both halves call the
-//! same steps the in-process flow uses ([`rehydrate_conversation`], then
-//! `persist_if_needed`). What it adds is [`HydrationContext`] — the in-process
+//! same steps the in-process flow uses — [`rehydrate_conversation`], then
+//! `payload_from_upstream_body` and `persist_if_needed`, the latter two shared
+//! with `fetch_blocking_payload`. What it adds is [`HydrationContext`] — the in-process
 //! flow threads a [`RequestContext`] between those steps, which is not
 //! serializable and so cannot cross the process boundary that now sits between
 //! them. It carries the minimum needed to rebuild one.
@@ -18,13 +19,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::executor::accumulator::ResponseAccumulator;
 use crate::executor::error::{ExecutorError, ExecutorResult};
 use crate::executor::persist::persist_if_needed;
 use crate::executor::rehydrate::rehydrate_conversation;
 use crate::executor::request::{ExecutionContext, RequestContext};
+use crate::executor::upstream::payload_from_upstream_body;
 use crate::types::event::ResponseStatus;
-use crate::types::io::{InputItem, ResponsesInput, ToolChoice};
+use crate::types::io::{ResponsesInput, ToolChoice};
 use crate::types::request_response::{RequestPayload, ResponsePayload};
 use crate::types::tools::ResponsesTool;
 use crate::utils::common::{serialize_to_string, serialize_to_value};
@@ -37,8 +38,6 @@ pub struct HydrationContext {
     pub response_id: String,
     /// The client's request as received, continuation ids intact.
     pub original_request: RequestPayload,
-    /// Only this turn's input items — what gets persisted.
-    pub new_input_items: Vec<InputItem>,
     pub conversation_id: Option<String>,
     pub effective_tools: Option<Vec<ResponsesTool>>,
     pub effective_tool_choice: Option<ToolChoice>,
@@ -46,16 +45,21 @@ pub struct HydrationContext {
 
 impl HydrationContext {
     /// Rebuilds the [`RequestContext`] the persistence path expects.
+    ///
+    /// `new_input_items` is derived rather than carried: only compaction and the
+    /// gateway tool loop ever diverge it from the request's own input, and
+    /// [`ensure_supported`] rejects both.
     fn into_request_context(self) -> RequestContext {
+        let new_input_items = Vec::from(&self.original_request.input);
         let mut enriched_request = self.original_request.clone();
         enriched_request.previous_response_id = None;
-        enriched_request.input = ResponsesInput::Items(self.new_input_items.clone());
+        enriched_request.input = ResponsesInput::Items(new_input_items.clone());
         enriched_request.tools = self.effective_tools;
         enriched_request.tool_choice = self.effective_tool_choice;
         RequestContext {
             original_request: self.original_request,
             enriched_request,
-            new_input_items: self.new_input_items,
+            new_input_items,
             response_id: self.response_id,
             conversation_id: self.conversation_id,
             conversation_version: None,
@@ -88,7 +92,6 @@ pub async fn hydrate(request: RequestPayload, exec_ctx: &ExecutionContext) -> Ex
         context: HydrationContext {
             response_id: ctx.response_id,
             original_request: ctx.original_request,
-            new_input_items: ctx.new_input_items,
             conversation_id: ctx.conversation_id,
             effective_tools: ctx.enriched_request.tools,
             effective_tool_choice: ctx.enriched_request.tool_choice,
@@ -111,13 +114,7 @@ pub async fn persist(
 ) -> ExecutorResult<ResponsePayload> {
     let ctx = context.into_request_context();
     let body = serialize_to_string(upstream_response).map_err(ExecutorError::JsonError)?;
-    let accumulator = ResponseAccumulator::from_json(&body, ctx.conversation_id.as_deref())?;
-    let mut payload = accumulator.finalize(
-        &ctx.enriched_request.model,
-        ctx.original_request.previous_response_id.as_deref(),
-        ctx.original_request.instructions.as_deref(),
-    );
-    ctx.inject_ids(&mut payload);
+    let payload = payload_from_upstream_body(&ctx, &body)?;
 
     // The in-process flow silently skips non-terminal statuses; here that would
     // return an envelope whose id can never be continued, so reject it.
@@ -148,33 +145,10 @@ fn ensure_supported(request: &RequestPayload) -> ExecutorResult<()> {
             "stream is not supported for split execution".into(),
         ));
     }
-    if request.conversation_id.is_some() {
-        return Err(ExecutorError::InvalidRequest(
-            "conversation_id is not supported for split execution; use previous_response_id".into(),
-        ));
-    }
-    let has_gateway_tools = request
-        .tools
-        .as_ref()
-        .is_some_and(|tools| tools.iter().any(|tool| !matches!(tool, ResponsesTool::Function(_))));
-    if has_gateway_tools {
-        return Err(ExecutorError::InvalidRequest(
-            "gateway-owned tools are not supported for split execution".into(),
-        ));
-    }
-    if request.input.contains_compaction() || request.input.has_compaction_trigger() {
-        return Err(ExecutorError::InvalidRequest(
-            "compaction input is not supported for split execution".into(),
-        ));
-    }
-    if request
-        .context_management
-        .as_ref()
-        .is_some_and(|entries| !entries.is_empty())
-    {
-        return Err(ExecutorError::InvalidRequest(
-            "context_management is not supported for split execution".into(),
-        ));
+    if let Some(feature) = request.in_process_feature() {
+        return Err(ExecutorError::InvalidRequest(format!(
+            "{feature} is not supported for split execution"
+        )));
     }
     Ok(())
 }
