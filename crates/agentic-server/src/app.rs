@@ -16,8 +16,8 @@ use agentic_core::proxy::ProxyState;
 
 use crate::auth::{ANTHROPIC_COUNT_TOKENS_PATH, ANTHROPIC_MESSAGES_PATH, OidcAuthenticator, require_oidc};
 use crate::handler::{
-    compact_response, conversations, count_tokens, health, internal_hydrate, internal_persist, messages, models, ready,
-    responses, responses_ws_with_auth,
+    compact_response, conversations, count_tokens, health, internal_hydrate, internal_persist, internal_tools,
+    messages, models, ready, responses, responses_ws_with_auth,
 };
 
 #[derive(Clone, Default)]
@@ -252,6 +252,7 @@ pub fn build_router_with_auth(
     // route (restrict them at the network layer).
     let internal_routes = Router::new()
         .route("/internal/hydrate", post(internal_hydrate))
+        .route("/internal/tools", post(internal_tools))
         .route("/internal/persist", post(internal_persist));
     let protected_routes = Router::new()
         .route("/v1/conversations", post(conversations))

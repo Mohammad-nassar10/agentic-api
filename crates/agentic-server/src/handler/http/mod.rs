@@ -5,7 +5,7 @@ mod models;
 mod responses;
 
 pub use conversations::conversations;
-pub use internal::{internal_hydrate, internal_persist};
+pub use internal::{internal_hydrate, internal_persist, internal_tools};
 pub use messages::{count_tokens, messages};
 pub use models::{health, models, ready};
 pub use responses::{compact_response, responses};

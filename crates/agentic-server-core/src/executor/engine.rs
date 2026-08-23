@@ -35,7 +35,7 @@ use crate::utils::common::utcnow_str;
 
 pub use crate::executor::inference::BoxStream;
 
-const MAX_GATEWAY_TOOL_ROUNDS: usize = 10;
+pub(super) const MAX_GATEWAY_TOOL_ROUNDS: usize = 10;
 
 fn add_usage(total: ResponseUsage, usage: ResponseUsage) -> ResponseUsage {
     ResponseUsage {
@@ -57,7 +57,7 @@ fn add_usage(total: ResponseUsage, usage: ResponseUsage) -> ResponseUsage {
     }
 }
 
-fn accumulate_usage(total: &mut Option<ResponseUsage>, usage: Option<ResponseUsage>) {
+pub(super) fn accumulate_usage(total: &mut Option<ResponseUsage>, usage: Option<ResponseUsage>) {
     if let Some(usage) = usage {
         *total = Some(total.map_or(usage, |current| add_usage(current, usage)));
     }

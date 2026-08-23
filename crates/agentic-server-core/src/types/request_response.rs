@@ -106,21 +106,22 @@ where
 }
 
 impl RequestPayload {
+    /// Name reported for a request carrying tools the gateway executes itself.
+    /// Split execution can serve these when its caller runs the tool loop, so
+    /// it is the one feature name a caller may choose to accept.
+    pub const GATEWAY_TOOLS_FEATURE: &'static str = "gateway-owned tools";
+
     /// Names the feature in this request that only the in-process executor
     /// implements, if any. Such a request cannot be served by the passthrough
     /// proxy or by split execution; the returned name lets a caller say which
     /// feature forced its hand.
+    ///
+    /// [`Self::GATEWAY_TOOLS_FEATURE`] is checked last, so a caller that
+    /// accepts it knows no other feature is also present.
     #[must_use]
     pub fn in_process_feature(&self) -> Option<&'static str> {
         if self.conversation_id.is_some() {
             return Some("conversation_id");
-        }
-        if self
-            .tools
-            .as_ref()
-            .is_some_and(|tools| tools.iter().any(|tool| !matches!(tool, ResponsesTool::Function(_))))
-        {
-            return Some("gateway-owned tools");
         }
         if self.input.contains_compaction() || self.input.has_compaction_trigger() {
             return Some("compaction input");
@@ -131,6 +132,13 @@ impl RequestPayload {
             .is_some_and(|entries| !entries.is_empty())
         {
             return Some("context_management");
+        }
+        if self
+            .tools
+            .as_ref()
+            .is_some_and(|tools| tools.iter().any(|tool| !matches!(tool, ResponsesTool::Function(_))))
+        {
+            return Some(Self::GATEWAY_TOOLS_FEATURE);
         }
         None
     }
