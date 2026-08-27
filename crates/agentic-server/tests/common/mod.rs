@@ -28,6 +28,9 @@ pub fn test_config(llm_url: &str) -> Config {
     }
 }
 
+// This module is compiled into every integration-test binary; not all of them
+// use every helper.
+#[allow(dead_code)]
 pub fn test_state(config: &Config) -> AppState {
     let exec_ctx = ExecutionContext::new(
         ConversationHandler::new(ConversationStore::disabled()),
@@ -47,10 +50,13 @@ pub fn test_state(config: &Config) -> AppState {
         llm_api_base: config.llm_api_base.clone(),
         skip_llm_ready_check: config.skip_llm_ready_check,
         openai_api_key: config.openai_api_key.clone(),
+        compaction_address: None,
+        compaction_thresholds: agentic_server::pool_signals::Thresholds::default(),
     }
 }
 
 /// Spawn a minimal mock LLM that responds to `GET /health` with 200.
+#[allow(dead_code)]
 pub async fn spawn_mock_llm() -> (String, tokio::task::JoinHandle<()>) {
     let app = Router::new().route("/health", get(|| async { StatusCode::OK.into_response() }));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

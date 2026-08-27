@@ -21,6 +21,9 @@ pub mod response;
 // Conversation storage operations
 pub mod conversation;
 
+// Per-session prompt prefix storage operations
+pub mod session_prefix;
+
 // Re-export commonly used types for convenience
 pub use backend::DatabaseBackend;
 pub use conversation::ConversationStore;
@@ -33,6 +36,7 @@ pub use pool::{
 };
 pub use response::ResponseStore;
 pub use schema::{PoolWithSchema, SchemaManager};
+pub use session_prefix::{SessionPrefixData, SessionPrefixStore};
 pub use types::{
     ConversationData, ConversationSnapshot, ConversationVersion, InOutItem, ItemKind, ResponseData, ResponseMetadata,
     StorageError, StoreResult,

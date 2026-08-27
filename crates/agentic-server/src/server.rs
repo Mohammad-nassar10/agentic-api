@@ -46,6 +46,8 @@ async fn build_state(config: &Config, shutdown_token: CancellationToken) -> Resu
         llm_api_base: config.llm_api_base.clone(),
         skip_llm_ready_check: config.skip_llm_ready_check,
         openai_api_key: config.openai_api_key.clone(),
+        compaction_address: agentic_server::compaction::address_from_env(),
+        compaction_thresholds: agentic_server::pool_signals::Thresholds::from_env()?,
     })
 }
 
