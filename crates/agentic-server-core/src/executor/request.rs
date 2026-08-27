@@ -1,6 +1,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use crate::config::{Config, default_database_url};
 use crate::error::Error;
 use crate::executor::modes::{ConversationHandler, ResponseHandler};
@@ -9,9 +11,10 @@ use crate::storage::{
     ConversationStore, ConversationVersion, DatabaseBackend, ResponseStore, create_pool_with_schema_and_configs,
 };
 use crate::tool::{GatewayExecutor, GatewayExecutors};
-use crate::types::io::InputItem;
+use crate::types::io::{InputItem, ResponsesInput, ToolChoice};
 use crate::types::messages::GatewayToolMap;
 use crate::types::request_response::{RequestPayload, ResponsePayload};
+use crate::types::tools::ResponsesTool;
 
 /// Env var configuring client-tool → gateway-executor aliases for `/v1/messages`
 /// (e.g. `WebSearch=web_search`). Empty/unset means no aliases — client
@@ -19,6 +22,8 @@ use crate::types::request_response::{RequestPayload, ResponsePayload};
 const GATEWAY_TOOL_ALIASES_ENV: &str = "MESSAGES_GATEWAY_TOOL_ALIASES";
 
 /// Context built by `rehydrate_conversation`, threaded through the execute pipeline.
+///
+/// Converts to and from [`SplitContext`] when a turn crosses a process boundary.
 #[derive(Debug)]
 pub struct RequestContext {
     /// Untouched original request from the client.
@@ -46,6 +51,54 @@ impl RequestContext {
         payload
             .previous_response_id
             .clone_from(&self.original_request.previous_response_id);
+    }
+}
+
+/// Wire form of a [`RequestContext`]: the subset that survives leaving the process.
+///
+/// Absent on purpose: `enriched_request` (the conversation, already in flight as
+/// the request — rebuilt on return) and `new_input_items` (derived).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SplitContext {
+    /// Response id reserved for this turn (`resp_` prefix).
+    pub response_id: String,
+    /// The client's request as received, continuation ids intact.
+    pub original_request: RequestPayload,
+    pub conversation_id: Option<String>,
+    /// Resolved against the stored chain; the only part of `enriched_request`
+    /// that `original_request` cannot supply.
+    pub effective_tools: Option<Vec<ResponsesTool>>,
+    pub effective_tool_choice: Option<ToolChoice>,
+}
+
+impl From<RequestContext> for SplitContext {
+    fn from(ctx: RequestContext) -> Self {
+        Self {
+            response_id: ctx.response_id,
+            original_request: ctx.original_request,
+            conversation_id: ctx.conversation_id,
+            effective_tools: ctx.enriched_request.tools,
+            effective_tool_choice: ctx.enriched_request.tool_choice,
+        }
+    }
+}
+
+impl From<SplitContext> for RequestContext {
+    fn from(wire: SplitContext) -> Self {
+        let new_input_items = Vec::from(&wire.original_request.input);
+        let mut enriched_request = wire.original_request.clone();
+        enriched_request.previous_response_id = None;
+        enriched_request.input = ResponsesInput::Items(new_input_items.clone());
+        enriched_request.tools = wire.effective_tools;
+        enriched_request.tool_choice = wire.effective_tool_choice;
+        Self {
+            original_request: wire.original_request,
+            enriched_request,
+            new_input_items,
+            response_id: wire.response_id,
+            conversation_id: wire.conversation_id,
+            conversation_version: None,
+        }
     }
 }
 

@@ -32,6 +32,15 @@ pub(super) struct StreamPayload {
     pub(super) deferred_events: Vec<EventFrame>,
 }
 
+/// Builds the JSON body sent upstream, so the request shape is defined once.
+///
+/// # Errors
+/// A tool-configuration or serialization failure.
+pub(super) fn upstream_request_json(ctx: &RequestContext, stream: bool) -> ExecutorResult<String> {
+    let request = ctx.enriched_request.to_upstream_request(stream)?;
+    serialize_to_string(&request).map_err(ExecutorError::JsonError)
+}
+
 pub(super) async fn fetch_blocking_payload(
     ctx: &RequestContext,
     exec_ctx: &ExecutionContext,
@@ -39,20 +48,64 @@ pub(super) async fn fetch_blocking_payload(
 ) -> ExecutorResult<ResponsePayload> {
     let url = exec_ctx.responses_url();
     // Non-streaming request: stream=false -> full JSON body -> from_json.
-    let upstream_request = ctx.enriched_request.to_upstream_request(false)?;
-    let upstream_json = serialize_to_string(&upstream_request).map_err(ExecutorError::JsonError)?;
+    let upstream_json = upstream_request_json(ctx, false)?;
 
     let body = fetch_response_json(upstream_json, &url, &exec_ctx.client, auth).await?;
 
-    let acc = ResponseAccumulator::from_json(&body, ctx.conversation_id.as_deref())?;
+    payload_from_upstream(ctx, UpstreamBody::Json(&body))
+}
+
+/// A complete upstream response, in whichever form the caller received it.
+#[derive(Debug, Clone, Copy)]
+pub enum UpstreamBody<'a> {
+    Json(&'a str),
+    /// Frames of a streamed response, already relayed by the caller.
+    Sse(&'a str),
+}
+
+fn absorb_line(acc: &mut ResponseAccumulator, ctx: &RequestContext, line: &str) {
+    if let Some(frame) = acc.process_sse_line(line) {
+        log_upstream_failure(&frame, &ctx.response_id);
+    }
+}
+
+/// Assembles the final [`ResponsePayload`], stamping our ids over the upstream's.
+///
+/// # Errors
+/// A parse error for an invalid JSON body; [`ExecutorError::InvalidRequest`] for
+/// an SSE relay cut short, which `finish_stream` would call complete.
+pub(super) fn payload_from_upstream(
+    ctx: &RequestContext,
+    upstream: UpstreamBody<'_>,
+) -> ExecutorResult<ResponsePayload> {
+    let acc = match upstream {
+        UpstreamBody::Json(body) => ResponseAccumulator::from_json(body, ctx.conversation_id.as_deref())?,
+        UpstreamBody::Sse(sse) => {
+            let mut acc = ResponseAccumulator::new(ctx.response_id.clone(), ctx.conversation_id.clone());
+            for line in sse.lines() {
+                absorb_line(&mut acc, ctx, line);
+            }
+            if !acc.saw_terminal_frame() {
+                return Err(ExecutorError::InvalidRequest(
+                    "upstream stream ended without a terminal event".to_owned(),
+                ));
+            }
+            acc.finish_stream();
+            acc
+        }
+    };
+    Ok(finalize_payload(ctx, acc))
+}
+
+/// The tail both legs share: request-derived fields in, our ids stamped on.
+fn finalize_payload(ctx: &RequestContext, acc: ResponseAccumulator) -> ResponsePayload {
     let mut payload = acc.finalize(
         &ctx.enriched_request.model,
         ctx.original_request.previous_response_id.as_deref(),
         ctx.original_request.instructions.as_deref(),
     );
     ctx.inject_ids(&mut payload);
-
-    Ok(payload)
+    payload
 }
 
 pub(super) async fn fetch_stream_payload(
@@ -67,8 +120,7 @@ pub(super) async fn fetch_stream_payload(
     output_offset: usize,
 ) -> ExecutorResult<StreamPayload> {
     let url = exec_ctx.responses_url();
-    let upstream_request = ctx.enriched_request.to_upstream_request(true)?;
-    let upstream_json = serialize_to_string(&upstream_request).map_err(ExecutorError::JsonError)?;
+    let upstream_json = upstream_request_json(ctx, true)?;
     let mut line_stream = Box::pin(call_inference(
         upstream_json,
         url,
@@ -84,9 +136,7 @@ pub(super) async fn fetch_stream_payload(
     while let Some(line_result) = line_stream.next().await {
         let line = line_result?;
         if stream.is_none() {
-            if let Some(frame) = acc.process_sse_line(&line) {
-                log_upstream_failure(&frame, &ctx.response_id);
-            }
+            absorb_line(&mut acc, ctx, &line);
             continue;
         }
         if let Some(translation) = acc.process_sse_line_with_translator(&line, &mut function_sse)? {
@@ -130,12 +180,7 @@ pub(super) async fn fetch_stream_payload(
         }
     }
     acc.finish_stream();
-    let mut payload = acc.finalize(
-        &ctx.enriched_request.model,
-        ctx.original_request.previous_response_id.as_deref(),
-        ctx.original_request.instructions.as_deref(),
-    );
-    ctx.inject_ids(&mut payload);
+    let payload = finalize_payload(ctx, acc);
     Ok(StreamPayload {
         payload,
         deferred_events,
