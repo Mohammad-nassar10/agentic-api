@@ -13,6 +13,7 @@ pub mod modes;
 pub mod persist;
 pub mod rehydrate;
 pub mod request;
+pub mod split;
 
 mod gateway;
 pub mod gateway_accumulator;
