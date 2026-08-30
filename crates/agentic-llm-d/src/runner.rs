@@ -23,11 +23,18 @@ pub enum Error {
 ///
 /// # Errors
 /// If the storage pool cannot be opened, or the address cannot be bound.
-pub async fn serve(config: &Config, host: &str, port: u16, shutdown: CancellationToken) -> Result<(), Error> {
+pub async fn serve(
+    config: &Config,
+    signing_key: Vec<u8>,
+    host: &str,
+    port: u16,
+    shutdown: CancellationToken,
+) -> Result<(), Error> {
     let exec_ctx = Arc::new(ExecutionContext::from_config(config).await?);
+    let signing_key = Arc::new(signing_key);
     let listener = TcpListener::bind(format!("{host}:{port}")).await?;
     info!("agentic-llm-d listening on {host}:{port} — no proxy, no inference");
-    axum::serve(listener, build_internal_router(InternalState { exec_ctx }))
+    axum::serve(listener, build_internal_router(InternalState { exec_ctx, signing_key }))
         .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await?;
     Ok(())

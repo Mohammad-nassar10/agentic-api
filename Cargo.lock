@@ -9,6 +9,7 @@ dependencies = [
  "agentic-server-core",
  "axum",
  "clap",
+ "jsonwebtoken",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

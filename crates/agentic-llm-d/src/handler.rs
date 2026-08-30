@@ -1,6 +1,7 @@
-//! The endpoints, and the axum glue they need. They trust their caller:
-//! `hydrate` returns full conversation history and `persist` writes a turn from
-//! a caller-supplied context, so bind this binary cluster-internal only.
+//! The endpoints, and the axum glue they need. Neither authenticates its caller
+//! yet: `hydrate` returns the full history behind any known response id, and
+//! `persist` writes a turn from a caller-supplied context. Bind this binary to a
+//! cluster-internal address until that is settled.
 
 use std::time::Duration;
 
@@ -13,12 +14,15 @@ use serde::de::DeserializeOwned;
 use serde_json::value::RawValue;
 use tracing::warn;
 
-use agentic_core::executor::ExecutorError;
-use agentic_core::executor::request::SplitContext;
-use agentic_core::executor::split::{self, UpstreamBody};
+use agentic_core::executor::request::RequestContext;
+
+use agentic_core::executor::{
+    ExecutorError, UpstreamBody, commit, decode_upstream, rehydrate_conversation, upstream_request,
+};
 use agentic_core::types::request_response::RequestPayload;
 
 use crate::InternalState;
+use crate::context::{Hydration, ensure_splittable, seal, unseal};
 
 const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 /// Readiness means storage answers — llm-d owns the model fleet.
@@ -27,7 +31,7 @@ const STORAGE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Body of `POST /internal/persist`: the context, plus exactly one response form.
 #[derive(Debug, Deserialize)]
 pub struct PersistRequest {
-    context: SplitContext,
+    context: String,
     response: Option<Box<RawValue>>,
     sse: Option<String>,
 }
@@ -49,10 +53,21 @@ pub async fn internal_hydrate(State(state): State<InternalState>, req: Request) 
         Ok(payload) => payload,
         Err(response) => return response,
     };
-    match split::hydrate(payload, state.exec_ctx.as_ref()).await {
+    match hydrate(payload, &state).await {
         Ok(hydration) => axum::Json(hydration).into_response(),
         Err(error) => error_response(error),
     }
+}
+
+/// Rehydrates the turn and builds the request the caller forwards to a model.
+#[allow(clippy::result_large_err)] // `ExecutorError` is core's; boxing it is not ours to decide
+async fn hydrate(request: RequestPayload, state: &InternalState) -> agentic_core::executor::ExecutorResult<Hydration> {
+    ensure_splittable(&request)?;
+    let ctx = rehydrate_conversation(request, state.exec_ctx.as_ref()).await?;
+    let stream = ctx.original_request.stream;
+    let request = RawValue::from_string(upstream_request(&ctx, stream)?).map_err(ExecutorError::JsonError)?;
+    let context = seal(ctx.into(), &state.signing_key)?;
+    Ok(Hydration { request, context })
 }
 
 pub async fn internal_persist(State(state): State<InternalState>, req: Request) -> Response {
@@ -70,7 +85,16 @@ pub async fn internal_persist(State(state): State<InternalState>, req: Request) 
             return error_response(ExecutorError::InvalidRequest(message));
         }
     };
-    match split::persist(context, upstream, state.exec_ctx.as_ref()).await {
+    let context = match unseal(&context, &state.signing_key) {
+        Ok(context) => context,
+        Err(error) => return error_response(error),
+    };
+    let ctx = RequestContext::from(context);
+    let stored = match decode_upstream(&ctx, upstream) {
+        Ok(payload) => commit(ctx, payload, state.exec_ctx.as_ref()).await,
+        Err(error) => Err(error),
+    };
+    match stored {
         Ok(payload) => axum::Json(payload).into_response(),
         Err(error) => error_response(error),
     }

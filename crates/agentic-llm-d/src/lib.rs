@@ -1,6 +1,7 @@
 //! Backend mode — agentic-api as state services for an orchestrator that runs
 //! inference itself (the llm-d coordinator). Nothing here proxies or calls a model.
 
+pub mod context;
 pub mod handler;
 pub mod runner;
 
@@ -16,6 +17,9 @@ use agentic_core::executor::ExecutionContext;
 #[derive(Clone)]
 pub struct InternalState {
     pub exec_ctx: Arc<ExecutionContext>,
+    /// Seals the context between hydrate and persist, so a caller cannot forge
+    /// one. Required: the endpoints have no other proof of where a turn began.
+    pub signing_key: Arc<Vec<u8>>,
 }
 
 /// The whole surface: two split-execution endpoints and two probes.

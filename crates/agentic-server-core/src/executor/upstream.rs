@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::events::{EventFrame, SSEEventType, WireEvent};
@@ -14,8 +15,9 @@ use crate::executor::gateway_accumulator::{GatewayStreamAccumulator, StreamEvent
 use crate::executor::inference::{call_inference, fetch_response_json};
 use crate::executor::request::{ExecutionContext, RequestContext};
 use crate::tool::ToolRegistry;
+use crate::types::io::OutputItem;
 use crate::types::request_response::ResponsePayload;
-use crate::utils::common::serialize_to_string;
+use crate::utils::common::{deserialize_from_str, serialize_to_string};
 
 const MAX_DEFERRED_STREAM_BYTES: usize = 256 * 1024;
 
@@ -32,11 +34,12 @@ pub(super) struct StreamPayload {
     pub(super) deferred_events: Vec<EventFrame>,
 }
 
-/// Builds the JSON body sent upstream, so the request shape is defined once.
+/// Builds the JSON body sent upstream: history inlined, continuation and storage
+/// fields removed. The request shape is defined once, here.
 ///
 /// # Errors
 /// A tool-configuration or serialization failure.
-pub(super) fn upstream_request_json(ctx: &RequestContext, stream: bool) -> ExecutorResult<String> {
+pub fn upstream_request(ctx: &RequestContext, stream: bool) -> ExecutorResult<String> {
     let request = ctx.enriched_request.to_upstream_request(stream)?;
     serialize_to_string(&request).map_err(ExecutorError::JsonError)
 }
@@ -48,7 +51,7 @@ pub(super) async fn fetch_blocking_payload(
 ) -> ExecutorResult<ResponsePayload> {
     let url = exec_ctx.responses_url();
     // Non-streaming request: stream=false -> full JSON body -> from_json.
-    let upstream_json = upstream_request_json(ctx, false)?;
+    let upstream_json = upstream_request(ctx, false)?;
 
     let body = fetch_response_json(upstream_json, &url, &exec_ctx.client, auth).await?;
 
@@ -69,11 +72,55 @@ fn absorb_line(acc: &mut ResponseAccumulator, ctx: &RequestContext, line: &str) 
     }
 }
 
+/// Rejects a response body that [`ResponseAccumulator::from_json`] would accept
+/// too generously. That parser reads what our own upstream call returned, so it
+/// defaults a missing `status` to `completed` and drops output items it cannot
+/// deserialize. Applied to a body supplied by an external caller, those defaults
+/// would let an invalid response be stored as a finished turn, so a caller that
+/// did not fetch the body itself must check it first.
+///
+/// # Errors
+/// [`ExecutorError::InvalidRequest`] naming the field that is missing or invalid.
+pub fn ensure_strict_response(body: &str) -> ExecutorResult<()> {
+    let json: Value = deserialize_from_str(body).map_err(ExecutorError::JsonError)?;
+    if !json["status"].is_string() {
+        return Err(ExecutorError::InvalidRequest(
+            "upstream response has no 'status'".to_owned(),
+        ));
+    }
+    let Some(items) = json["output"].as_array() else {
+        return Err(ExecutorError::InvalidRequest(
+            "upstream response has no 'output' array".to_owned(),
+        ));
+    };
+    for (index, item) in items.iter().enumerate() {
+        if let Err(error) = OutputItem::deserialize(item) {
+            return Err(ExecutorError::InvalidRequest(format!(
+                "upstream response output[{index}] is not a valid item: {error}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Assembles the final [`ResponsePayload`], stamping our ids over the upstream's.
 ///
 /// # Errors
 /// A parse error for an invalid JSON body; [`ExecutorError::InvalidRequest`] for
 /// an SSE relay cut short, which `finish_stream` would call complete.
+/// Decodes a complete upstream response. A body the caller supplied is checked
+/// first, since the in-process parser fills in a missing status and drops
+/// unreadable items — safe for our own fetch, not for outside input.
+///
+/// # Errors
+/// [`ExecutorError::InvalidRequest`] for an incomplete response, or a parse error.
+pub fn decode_upstream(ctx: &RequestContext, upstream: UpstreamBody<'_>) -> ExecutorResult<ResponsePayload> {
+    if let UpstreamBody::Json(body) = upstream {
+        ensure_strict_response(body)?;
+    }
+    payload_from_upstream(ctx, upstream)
+}
+
 pub(super) fn payload_from_upstream(
     ctx: &RequestContext,
     upstream: UpstreamBody<'_>,
@@ -120,7 +167,7 @@ pub(super) async fn fetch_stream_payload(
     output_offset: usize,
 ) -> ExecutorResult<StreamPayload> {
     let url = exec_ctx.responses_url();
-    let upstream_json = upstream_request_json(ctx, true)?;
+    let upstream_json = upstream_request(ctx, true)?;
     let mut line_stream = Box::pin(call_inference(
         upstream_json,
         url,

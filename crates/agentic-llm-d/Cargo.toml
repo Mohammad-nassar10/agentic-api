@@ -11,6 +11,7 @@ publish = false
 agentic-core.workspace = true
 axum.workspace = true
 clap.workspace = true
+jsonwebtoken.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
