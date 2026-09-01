@@ -24,6 +24,11 @@ struct Cli {
     /// it a caller could forge a context and write turns under any id.
     #[arg(long, env = "INTERNAL_SIGNING_KEY", hide_env_values = true)]
     signing_key: String,
+
+    /// Shared secret every `/internal` caller must present as a bearer token.
+    /// Required: these endpoints read and write conversation history.
+    #[arg(long, env = "INTERNAL_API_TOKEN", hide_env_values = true)]
+    api_token: String,
 }
 
 #[tokio::main]
@@ -52,7 +57,15 @@ async fn main() -> Result<(), runner::Error> {
         }
     });
 
-    runner::serve(&config, cli.signing_key.into_bytes(), &cli.host, cli.port, shutdown).await
+    runner::serve(
+        &config,
+        cli.signing_key.into_bytes(),
+        cli.api_token,
+        &cli.host,
+        cli.port,
+        shutdown,
+    )
+    .await
 }
 
 /// Kubernetes terminates containers with SIGTERM, whose default action would

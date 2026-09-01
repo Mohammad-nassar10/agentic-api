@@ -56,7 +56,9 @@ since the coordinator owns the model fleet.
 
 ## Discussion points
 
-The `/internal` endpoints carry no credential and trust their caller, so restricting them is a network-layer concern
-today. A retried `persist` conflicts with the response-identifier primary key and returns a server error rather than
+The `/internal` endpoints do not authenticate their caller yet, so restricting them is a network-layer concern today.
+The coordinator holds the caller's bearer token, so forwarding it to the existing OIDC layer is one option;
+authenticating the coordinator as a workload is another. Either way, per-response authorization needs an owner the
+schema does not yet record. A retried `persist` conflicts with the response-identifier primary key and returns a server error rather than
 the turn it already stored. Request fields that `RequestPayload` does not model are dropped rather than forwarded,
 which narrows what reaches vLLM compared with plain passthrough.

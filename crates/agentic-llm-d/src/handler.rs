@@ -1,13 +1,14 @@
-//! The endpoints, and the axum glue they need. Neither authenticates its caller
-//! yet: `hydrate` returns the full history behind any known response id, and
-//! `persist` writes a turn from a caller-supplied context. Bind this binary to a
-//! cluster-internal address until that is settled.
+//! The endpoints, and the axum glue they need. Both read and write conversation
+//! history, so `/internal` requires a shared bearer token; the probes do not.
+//! Keep the listener cluster-internal regardless - the token identifies nobody,
+//! so it authenticates the caller without authorizing it per tenant.
 
 use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -25,7 +26,7 @@ use crate::InternalState;
 use crate::context::{Hydration, ensure_splittable, seal, unseal};
 
 const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
-/// Readiness means storage answers — llm-d owns the model fleet.
+/// Readiness means storage answers - llm-d owns the model fleet.
 const STORAGE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Body of `POST /internal/persist`: the context, plus exactly one response form.
@@ -34,6 +35,35 @@ pub struct PersistRequest {
     context: String,
     response: Option<Box<RawValue>>,
     sse: Option<String>,
+}
+
+/// Rejects any `/internal` call that does not present the shared secret. These
+/// endpoints read and write conversation history, so an unauthenticated caller
+/// must not reach them; the probes are layered separately and stay open.
+pub async fn require_token(State(state): State<InternalState>, request: Request, next: Next) -> Response {
+    let presented = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    match presented {
+        Some(token) if token_matches(token, &state.api_token) => next.run(request).await,
+        _ => json(
+            StatusCode::UNAUTHORIZED,
+            br#"{"error":{"type":"invalid_request_error","message":"missing or invalid bearer token"}}"#.to_vec(),
+        ),
+    }
+}
+
+/// Compared without an early return, so a wrong token takes the same time
+/// whatever its first differing byte.
+fn token_matches(presented: &str, expected: &str) -> bool {
+    presented.len() == expected.len()
+        && presented
+            .bytes()
+            .zip(expected.bytes())
+            .fold(0_u8, |differences, (a, b)| differences | (a ^ b))
+            == 0
 }
 
 pub async fn health() -> StatusCode {

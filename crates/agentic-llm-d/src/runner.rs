@@ -26,16 +26,25 @@ pub enum Error {
 pub async fn serve(
     config: &Config,
     signing_key: Vec<u8>,
+    api_token: String,
     host: &str,
     port: u16,
     shutdown: CancellationToken,
 ) -> Result<(), Error> {
     let exec_ctx = Arc::new(ExecutionContext::from_config(config).await?);
     let signing_key = Arc::new(signing_key);
+    let api_token = Arc::new(api_token);
     let listener = TcpListener::bind(format!("{host}:{port}")).await?;
     info!("agentic-llm-d listening on {host}:{port} — no proxy, no inference");
-    axum::serve(listener, build_internal_router(InternalState { exec_ctx, signing_key }))
-        .with_graceful_shutdown(async move { shutdown.cancelled().await })
-        .await?;
+    axum::serve(
+        listener,
+        build_internal_router(InternalState {
+            exec_ctx,
+            signing_key,
+            api_token,
+        }),
+    )
+    .with_graceful_shutdown(async move { shutdown.cancelled().await })
+    .await?;
     Ok(())
 }
