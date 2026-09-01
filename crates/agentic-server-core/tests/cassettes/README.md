@@ -83,6 +83,7 @@ model requested by Codex 0.149.1.
 --openai URL           OpenAI upstream (default https://api.openai.com)
 --tools FILE           JSON file containing a tools array (responses mode only)
 --tool-choice VALUE    "auto", "none", "required", or JSON e.g. '{"type":"function","name":"foo"}'
+--reasoning JSON       JSON object containing Responses reasoning settings
 --input-file FILE       JSON string or item array for one HTTP Responses turn
 --max-output-tokens N  max_output_tokens for Responses requests (default 1024; use 0 to omit)
 --proxy-port PORT      Local proxy port (default 7070)
@@ -192,12 +193,13 @@ turns:
 | Script | Cassettes | Backend |
 |--------|-----------|---------|
 | `record_text_only_cassettes.sh` | 10 text-only cassettes (responses + conv modes, streaming + non-streaming) | OpenAI (`OPENAI_API_KEY`) |
-| `record_reasoning_cassettes.sh` | 2 reasoning cassettes (single turn, streaming + non-streaming) | vLLM |
+| `record_reasoning_cassettes.sh` | Matching explicit-reasoning cassettes (streaming + non-streaming) | gateway and OpenAI reference; optional direct vLLM |
 | `record_tool_call_cassettes.sh` | 8 tool-call cassettes (4 tool_choice modes x streaming + non-streaming) | vLLM |
 | `record_codex_cli_tool_call_cassettes.sh` | Codex function/namespace/custom-tool matrix | gateway, vLLM, and OpenAI |
 | `record_custom_tool_cassettes.sh` | Matching two-turn custom-tool flows (streaming + non-streaming) | gateway and OpenAI reference |
 | `record_mcp_cassettes.sh` | Native MCP counter tool discovery and calls (streaming + non-streaming) | gateway and OpenAI reference |
 | `record_web_search_cassettes.sh` | Matching web-search calls (streaming + non-streaming) | gateway and OpenAI reference |
+| `record_dynamo_cassettes.sh` | Stateful two-turn and client-executed function tool call cassettes (streaming + non-streaming) | NVIDIA Dynamo frontend |
 
 ### Text-only (OpenAI)
 
@@ -206,12 +208,44 @@ OPENAI_API_KEY=sk-... bash tests/cassettes/record_text_only_cassettes.sh
 MODEL=gpt-4o-mini OPENAI_API_KEY=sk-... bash tests/cassettes/record_text_only_cassettes.sh
 ```
 
-### Reasoning (vLLM)
+### Reasoning (gateway and OpenAI)
+
+The default records the same explicit `reasoning` object against OpenAI and the
+gateway for both response modes. The gateway fixture uses the same OpenAI model
+as its reference so the comparison isolates gateway request and response
+handling from model differences. Use `REASONING_RECORD_SET=gateway`,
+`REASONING_RECORD_SET=openai`, or `REASONING_RECORD_SET=vllm` to record one
+provider. The gateway recording requires a running gateway and reasoning-capable
+upstream; the optional direct-vLLM set retains the legacy accumulator workflow.
+Every selected recording is staged and validated before any final fixture is
+replaced, so a failed provider or response cannot leave a partially refreshed
+comparison set.
 
 ```bash
-vllm serve Qwen/Qwen3-30B-A3B-FP8 --reasoning-parser deepseek_r1 --port 5050 > server.log 2>&1
+# Start the gateway against the same OpenAI ground-truth model in one terminal.
+OPENAI_API_KEY=sk-... \
+cargo run -p agentic-server -- \
+  --llm-api-base https://api.openai.com \
+  --skip-llm-ready-check
 
-VLLM_URL=http://0.0.0.0:5050 MODEL=Qwen/Qwen3-30B-A3B-FP8 bash tests/cassettes/record_reasoning_cassettes.sh
+# Record the OpenAI-reference and gateway pairs from another terminal.
+OPENAI_API_KEY=sk-... \
+GATEWAY_URL=http://localhost:9000 \
+MODEL=gpt-5.6 \
+bash crates/agentic-server-core/tests/cassettes/record_reasoning_cassettes.sh
+
+# To refresh only the gateway-facing pair instead:
+REASONING_RECORD_SET=gateway \
+GATEWAY_URL=http://localhost:9000 \
+MODEL=gpt-5.6 \
+bash crates/agentic-server-core/tests/cassettes/record_reasoning_cassettes.sh
+
+vllm serve Qwen/Qwen3-30B-A3B-FP8 --reasoning-parser qwen3 --port 5050 > server.log 2>&1
+
+REASONING_RECORD_SET=vllm \
+VLLM_URL=http://0.0.0.0:5050 \
+MODEL=Qwen/Qwen3-30B-A3B-FP8 \
+bash crates/agentic-server-core/tests/cassettes/record_reasoning_cassettes.sh
 ```
 
 ### Tool calls (vLLM)
@@ -220,6 +254,17 @@ VLLM_URL=http://0.0.0.0:5050 MODEL=Qwen/Qwen3-30B-A3B-FP8 bash tests/cassettes/r
 vllm serve Qwen/Qwen3-30B-A3B-FP8 --tool-call-parser hermes --enable-auto-tool-choice --port 5050 > server.log 2>&1
 
 VLLM_URL=http://0.0.0.0:5050 MODEL=Qwen/Qwen3-30B-A3B-FP8 bash tests/cassettes/record_tool_call_cassettes.sh
+```
+
+### NVIDIA Dynamo (vLLM worker behind the Dynamo frontend)
+
+Dynamo's `/v1/responses` rejects `previous_response_id` with `501`, so the recorder's own turn chaining cannot be
+used. The script records turn 1 from a prompt, builds turn 2's input from turn 1's recorded assistant message (the
+hydrated item history the gateway sends upstream), records it, and merges both into one cassette. See
+[docs/guides/dynamo-upstream.md](../../../../docs/guides/dynamo-upstream.md) for the Dynamo launch commands.
+
+```bash
+DYNAMO_URL=http://127.0.0.1:8000 MODEL=openai/gpt-oss-20b bash tests/cassettes/record_dynamo_cassettes.sh
 ```
 
 ### Web search (gateway and OpenAI)
