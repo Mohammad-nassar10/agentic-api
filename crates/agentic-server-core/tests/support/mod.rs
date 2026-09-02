@@ -59,6 +59,10 @@ pub struct TurnBody {
     #[serde(default)]
     pub max_output_tokens: Option<u64>,
     #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
+    #[serde(default)]
+    pub previous_response_id: Option<String>,
+    #[serde(default)]
     pub reasoning: Option<Value>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -428,6 +432,7 @@ pub fn make_request(
         store,
         include: None,
         reasoning: None,
+        text: None,
         temperature: None,
         top_p: None,
         max_output_tokens: None,

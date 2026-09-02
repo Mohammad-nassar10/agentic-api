@@ -11,12 +11,12 @@ pub use io::{
     InputTokenDetails, McpCall, McpCallError, McpCallStatus, McpToolExecutionError, McpToolExecutionErrorContent,
     OutputItem, OutputMessage, OutputTextContent, OutputTokenDetails, ReasoningOutput, ReasoningTextContent,
     ResponseUsage, ResponsesInput, ToolCallOutput, ToolChoice, ToolOutputContent, WebSearchAction,
-    WebSearchActionFindInPage, WebSearchActionOpenPage, WebSearchActionSearch, WebSearchCall, WebSearchCallStatus,
-    WebSearchSource,
+    WebSearchActionError, WebSearchActionFindInPage, WebSearchActionOpenPage, WebSearchActionSearch, WebSearchCall,
+    WebSearchCallStatus, WebSearchSource,
 };
 pub use request_response::{
     CompactRequest, CompactedResponse, ContextManagement, IncompleteDetails, ReasoningConfig, RequestPayload,
-    ResponsePayload, UpstreamRequest, UpstreamTool,
+    ResponsePayload, ResponseTextConfig, ResponseTextFormat, UpstreamRequest, UpstreamTool,
 };
 pub use tools::{
     CodeInterpreterToolParam, CodexNamespaceMember, CodexNamespaceToolParam, CustomToolParam, EmptyToolNameError,

@@ -95,7 +95,7 @@ fn item_has_meaningful_context(item: &InputItem) -> bool {
                 || reasoning.encrypted_content.as_ref().is_some_and(value_has_content)
         }
         InputItem::Compaction(compaction) => !compaction.encrypted_content.trim().is_empty(),
-        InputItem::CompactionTrigger | InputItem::Unknown => false,
+        InputItem::McpListTools(_) | InputItem::CompactionTrigger | InputItem::Unknown => false,
     }
 }
 
@@ -147,6 +147,7 @@ fn request_payload(model: String, input: ResponsesInput, instructions: Option<St
         store: false,
         include: None,
         reasoning: None,
+        text: None,
         temperature: None,
         top_p: None,
         max_output_tokens: None,

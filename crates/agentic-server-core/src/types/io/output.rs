@@ -271,10 +271,17 @@ pub struct WebSearchActionSearch {
     #[serde(skip, default = "default_web_search_action_search_type")]
     pub type_: String,
     pub query: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub queries: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<WebSearchSource>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum WebSearchActionError {
+    #[error("web search action requires at least one query")]
+    EmptyQueries,
 }
 
 fn default_web_search_action_search_type() -> String {
@@ -282,14 +289,19 @@ fn default_web_search_action_search_type() -> String {
 }
 
 impl WebSearchActionSearch {
-    #[must_use]
-    pub fn new(query: impl Into<String>, sources: Vec<WebSearchSource>) -> Self {
-        Self {
+    /// Builds a search action from a non-empty query list.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WebSearchActionError::EmptyQueries`] if `queries` is empty.
+    pub fn try_new(queries: Vec<String>, sources: Vec<WebSearchSource>) -> Result<Self, WebSearchActionError> {
+        let query = queries.first().cloned().ok_or(WebSearchActionError::EmptyQueries)?;
+        Ok(Self {
             type_: default_web_search_action_search_type(),
-            query: query.into(),
-            queries: Vec::new(),
+            query,
+            queries,
             sources,
-        }
+        })
     }
 }
 
@@ -341,18 +353,22 @@ pub struct WebSearchCall {
 }
 
 impl WebSearchCall {
-    #[must_use]
-    pub fn new(
+    /// Builds a web-search call from a non-empty query list.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WebSearchActionError::EmptyQueries`] if `queries` is empty.
+    pub fn try_new(
         id: impl Into<String>,
         status: WebSearchCallStatus,
-        query: impl Into<String>,
+        queries: Vec<String>,
         sources: Vec<WebSearchSource>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, WebSearchActionError> {
+        Ok(Self {
             id: id.into(),
             status,
-            action: WebSearchAction::Search(WebSearchActionSearch::new(query, sources)),
-        }
+            action: WebSearchAction::Search(WebSearchActionSearch::try_new(queries, sources)?),
+        })
     }
 }
 
@@ -432,7 +448,7 @@ impl McpCall {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct McpListTool {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -812,7 +828,7 @@ impl OutputItem {
         match self {
             Self::FunctionCall(call) => registry
                 .lookup(&call.name)
-                .is_none_or(|entry| !entry.tool_type.is_gateway_owned()),
+                .is_none_or(|entry| !entry.ownership.is_gateway()),
             Self::CustomToolCall(_) => true,
             Self::Message(_)
             | Self::WebSearchCall(_)
@@ -824,6 +840,10 @@ impl OutputItem {
         }
     }
 
+    /// Shapes a stored output item as continuation input.
+    /// Public output for gateway-executed built-in tools is omitted because the model-facing
+    /// function call and output are persisted separately as input items. MCP
+    /// list metadata is retained here and removed by `ResponsesInput::model_input`.
     #[must_use]
     pub fn to_input_item(&self) -> Option<InputItem> {
         match self {
@@ -831,8 +851,9 @@ impl OutputItem {
             Self::Reasoning(reasoning) => Some(InputItem::Reasoning(reasoning.clone())),
             Self::FunctionCall(call) => Some(InputItem::FunctionCall(InputFunctionToolCall::from(call.clone()))),
             Self::CustomToolCall(call) => Some(InputItem::FunctionCall(call.clone().into())),
+            Self::McpListTools(list_tools) => Some(InputItem::McpListTools(list_tools.clone())),
             Self::Compaction(item) => Some(InputItem::Compaction(item.clone())),
-            Self::WebSearchCall(_) | Self::McpCall(_) | Self::McpListTools(_) | Self::Unknown => None,
+            Self::WebSearchCall(_) | Self::McpCall(_) | Self::Unknown => None,
         }
     }
 }
@@ -888,6 +909,62 @@ mod tests {
         };
         assert_eq!(call.name, "apply_patch");
         assert_eq!(call.arguments, r#"{"input":"*** Begin Patch\n*** End Patch"}"#);
+    }
+
+    #[test]
+    fn web_search_call_rejects_empty_queries() {
+        let error = WebSearchCall::try_new("ws_1", WebSearchCallStatus::Completed, Vec::new(), Vec::new()).unwrap_err();
+
+        assert_eq!(error, WebSearchActionError::EmptyQueries);
+    }
+
+    #[test]
+    fn web_search_call_preserves_valid_search_action_wire_shape() {
+        let call = WebSearchCall::try_new(
+            "ws_1",
+            WebSearchCallStatus::Completed,
+            vec!["rust async".to_owned()],
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(call).unwrap(),
+            serde_json::json!({
+                "id": "ws_1",
+                "status": "completed",
+                "action": {
+                    "type": "search",
+                    "query": "rust async",
+                    "queries": ["rust async"]
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn gateway_public_tool_outputs_are_not_replayed_as_model_input() {
+        let web_search = OutputItem::WebSearchCall(
+            WebSearchCall::try_new(
+                "ws_1",
+                WebSearchCallStatus::Completed,
+                vec!["rust async".to_owned()],
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+        let mcp = OutputItem::McpCall(McpCall::new(
+            "mcp_1",
+            "counter",
+            "increment",
+            "{}",
+            McpCallStatus::Completed,
+            Some("1".to_owned()),
+            None,
+        ));
+
+        assert!(web_search.to_input_item().is_none());
+        assert!(mcp.to_input_item().is_none());
     }
 
     #[test]
