@@ -1,13 +1,12 @@
-//! The endpoints, and the axum glue they need. Both read and write conversation
-//! history, so `/internal` requires a shared bearer token; the probes do not.
-//! Keep the listener cluster-internal regardless - the token identifies nobody,
-//! so it authenticates the caller without authorizing it per tenant.
+//! The endpoints and their axum glue. The split routes require a shared token;
+//! probes do not. Keep the listener cluster-internal regardless — the token
+//! authenticates the calling workload, not a tenant.
 
 use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{StatusCode, header};
+use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
@@ -22,14 +21,16 @@ use agentic_core::executor::{
 };
 use agentic_core::types::request_response::RequestPayload;
 
-use crate::InternalState;
+use crate::BackendState;
 use crate::context::{Hydration, ensure_splittable, seal, unseal};
 
 const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
+/// The calling workload's shared secret.
+pub const WORKLOAD_TOKEN_HEADER: &str = "x-agentic-workload-token";
 /// Readiness means storage answers - llm-d owns the model fleet.
 const STORAGE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Body of `POST /internal/persist`: the context, plus exactly one response form.
+/// Body of `POST /v1alpha/responses/persist`: the context, plus one response form.
 #[derive(Debug, Deserialize)]
 pub struct PersistRequest {
     context: String,
@@ -37,15 +38,14 @@ pub struct PersistRequest {
     sse: Option<String>,
 }
 
-/// Rejects any `/internal` call that does not present the shared secret. These
-/// endpoints read and write conversation history, so an unauthenticated caller
-/// must not reach them; the probes are layered separately and stay open.
-pub async fn require_token(State(state): State<InternalState>, request: Request, next: Next) -> Response {
+/// Rejects any split-route call without the shared secret. The probes are
+/// layered separately and stay open.
+pub async fn require_token(State(state): State<BackendState>, request: Request, next: Next) -> Response {
+    // Not `Authorization`: that stays free for the end user's token.
     let presented = request
         .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
+        .get(WORKLOAD_TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok());
     match presented {
         Some(token) if token_matches(token, &state.api_token) => next.run(request).await,
         _ => json(
@@ -55,8 +55,7 @@ pub async fn require_token(State(state): State<InternalState>, request: Request,
     }
 }
 
-/// Compared without an early return, so a wrong token takes the same time
-/// whatever its first differing byte.
+/// No early return, so a wrong token takes the same time whatever byte differs.
 fn token_matches(presented: &str, expected: &str) -> bool {
     presented.len() == expected.len()
         && presented
@@ -70,7 +69,7 @@ pub async fn health() -> StatusCode {
     StatusCode::OK
 }
 
-pub async fn ready(State(state): State<InternalState>) -> StatusCode {
+pub async fn ready(State(state): State<BackendState>) -> StatusCode {
     if state.exec_ctx.storage_ready(STORAGE_PROBE_TIMEOUT).await {
         StatusCode::OK
     } else {
@@ -78,12 +77,12 @@ pub async fn ready(State(state): State<InternalState>) -> StatusCode {
     }
 }
 
-pub async fn internal_hydrate(State(state): State<InternalState>, req: Request) -> Response {
+pub async fn hydrate(State(state): State<BackendState>, req: Request) -> Response {
     let payload: RequestPayload = match read_json(req.into_body()).await {
         Ok(payload) => payload,
         Err(response) => return response,
     };
-    match hydrate(payload, &state).await {
+    match build_hydration(payload, &state).await {
         Ok(hydration) => axum::Json(hydration).into_response(),
         Err(error) => error_response(error),
     }
@@ -91,22 +90,27 @@ pub async fn internal_hydrate(State(state): State<InternalState>, req: Request) 
 
 /// Rehydrates the turn and builds the request the caller forwards to a model.
 #[allow(clippy::result_large_err)] // `ExecutorError` is core's; boxing it is not ours to decide
-async fn hydrate(request: RequestPayload, state: &InternalState) -> agentic_core::executor::ExecutorResult<Hydration> {
+async fn build_hydration(
+    request: RequestPayload,
+    state: &BackendState,
+) -> agentic_core::executor::ExecutorResult<Hydration> {
     ensure_splittable(&request)?;
     let ctx = rehydrate_conversation(request, state.exec_ctx.as_ref()).await?;
+    // Rehydration can restore a gateway-owned tool from the stored turn, so
+    // check what will actually run.
+    ensure_splittable(&ctx.enriched_request)?;
     let stream = ctx.original_request.stream;
     let request = RawValue::from_string(upstream_request(&ctx, stream)?).map_err(ExecutorError::JsonError)?;
     let context = seal(ctx.into(), &state.signing_key)?;
     Ok(Hydration { request, context })
 }
 
-pub async fn internal_persist(State(state): State<InternalState>, req: Request) -> Response {
+pub async fn persist(State(state): State<BackendState>, req: Request) -> Response {
     let PersistRequest { context, response, sse } = match read_json(req.into_body()).await {
         Ok(request) => request,
         Err(response) => return response,
     };
-    // serde rejects `RawValue` inside `flatten`/`untagged`, so the wire cannot
-    // type "exactly one of". Narrow here.
+    // serde rejects `RawValue` in `untagged`, so "exactly one of" is checked here.
     let upstream = match (response.as_deref(), sse.as_deref()) {
         (Some(json), None) => UpstreamBody::Json(json.get()),
         (None, Some(sse)) => UpstreamBody::Sse(sse),

@@ -35,7 +35,7 @@ pub(super) struct StreamPayload {
 }
 
 /// Builds the JSON body sent upstream: history inlined, continuation and storage
-/// fields removed. The request shape is defined once, here.
+/// fields removed.
 ///
 /// # Errors
 /// A tool-configuration or serialization failure.
@@ -66,18 +66,25 @@ pub enum UpstreamBody<'a> {
     Sse(&'a str),
 }
 
-fn absorb_line(acc: &mut ResponseAccumulator, ctx: &RequestContext, line: &str) {
+fn absorb_line(acc: &mut ResponseAccumulator, ctx: &RequestContext, line: &str) -> bool {
     if let Some(frame) = acc.process_sse_line(line) {
         log_upstream_failure(&frame, &ctx.response_id);
+        return true;
     }
+    // Only a `data:` line that produced no frame is malformed.
+    !is_data_frame(line)
 }
 
-/// Rejects a response body that [`ResponseAccumulator::from_json`] would accept
-/// too generously. That parser reads what our own upstream call returned, so it
-/// defaults a missing `status` to `completed` and drops output items it cannot
-/// deserialize. Applied to a body supplied by an external caller, those defaults
-/// would let an invalid response be stored as a finished turn, so a caller that
-/// did not fetch the body itself must check it first.
+/// A `data:` payload the accumulator should have understood; `[DONE]` carries none.
+fn is_data_frame(line: &str) -> bool {
+    line.strip_prefix("data:")
+        .map(str::trim)
+        .is_some_and(|payload| !payload.is_empty() && payload != "[DONE]")
+}
+
+/// Rejects a body [`ResponseAccumulator::from_json`] would accept too generously:
+/// it defaults a missing `status` to `completed` and drops unreadable items, which
+/// is safe for our own fetch but not for a body an outside caller supplied.
 ///
 /// # Errors
 /// [`ExecutorError::InvalidRequest`] naming the field that is missing or invalid.
@@ -103,14 +110,7 @@ pub fn ensure_strict_response(body: &str) -> ExecutorResult<()> {
     Ok(())
 }
 
-/// Assembles the final [`ResponsePayload`], stamping our ids over the upstream's.
-///
-/// # Errors
-/// A parse error for an invalid JSON body; [`ExecutorError::InvalidRequest`] for
-/// an SSE relay cut short, which `finish_stream` would call complete.
-/// Decodes a complete upstream response. A body the caller supplied is checked
-/// first, since the in-process parser fills in a missing status and drops
-/// unreadable items — safe for our own fetch, not for outside input.
+/// Decodes a complete upstream response, checking a caller-supplied body first.
 ///
 /// # Errors
 /// [`ExecutorError::InvalidRequest`] for an incomplete response, or a parse error.
@@ -130,7 +130,11 @@ pub(super) fn payload_from_upstream(
         UpstreamBody::Sse(sse) => {
             let mut acc = ResponseAccumulator::new(ctx.response_id.clone(), ctx.conversation_id.clone());
             for line in sse.lines() {
-                absorb_line(&mut acc, ctx, line);
+                if !absorb_line(&mut acc, ctx, line) {
+                    return Err(ExecutorError::InvalidRequest(
+                        "upstream stream contains a malformed data frame".to_owned(),
+                    ));
+                }
             }
             if !acc.saw_terminal_frame() {
                 return Err(ExecutorError::InvalidRequest(
@@ -183,7 +187,7 @@ pub(super) async fn fetch_stream_payload(
     while let Some(line_result) = line_stream.next().await {
         let line = line_result?;
         if stream.is_none() {
-            absorb_line(&mut acc, ctx, &line);
+            let _ = absorb_line(&mut acc, ctx, &line);
             continue;
         }
         if let Some(translation) = acc.process_sse_line_with_translator(&line, &mut function_sse)? {

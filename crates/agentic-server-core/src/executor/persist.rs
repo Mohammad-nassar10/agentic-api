@@ -79,13 +79,12 @@ pub async fn persist_turn(
     }
 }
 
-/// Stores a decoded turn if the request asked for storage, for a caller that ran
-/// inference itself. A failed turn is returned unstored rather than raised, as
-/// the in-process flow does.
+/// Stores a decoded turn for a caller that ran inference itself. A failed turn is
+/// returned unstored, as the in-process flow does.
 ///
 /// # Errors
-/// [`ExecutorError::InvalidRequest`] for an unusable reserved id or an
-/// unfinished response, or a storage error.
+/// [`ExecutorError::InvalidRequest`] for an unusable id or unfinished response,
+/// [`ExecutorError::Conflict`] for an id already stored, or a storage error.
 pub async fn commit(
     ctx: RequestContext,
     payload: ResponsePayload,
@@ -105,9 +104,13 @@ pub async fn commit(
         )));
     }
 
-    // A retry carries the same reserved id and would hit the primary key.
+    // A retry carries the same reserved id. Returning the caller's payload would
+    // report content storage does not hold, so refuse instead.
     if exec_ctx.resp_handler.stored(&payload.id).await? {
-        return Ok(payload);
+        return Err(ExecutorError::Conflict(format!(
+            "a turn is already stored under '{}'",
+            payload.id
+        )));
     }
 
     persist_if_needed(

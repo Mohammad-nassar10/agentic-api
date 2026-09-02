@@ -7,7 +7,7 @@ use std::sync::Arc;
 use agentic_core::executor::request::RequestContext;
 use agentic_core::executor::{
     ConversationHandler, ExecutionContext, ExecutorError, ExecutorResult, ResponseHandler, UpstreamBody, commit,
-    decode_upstream, rehydrate_conversation, upstream_request,
+    decode_upstream, persist_turn, rehydrate_conversation, upstream_request,
 };
 use agentic_core::storage::{ConversationStore, ResponseStore, create_pool_with_schema};
 use agentic_core::types::request_response::{RequestPayload, ResponsePayload};
@@ -65,10 +65,11 @@ fn upstream_sse(text: &str) -> String {
 
 const KEY: &[u8] = b"test-signing-key";
 
-/// What the `/internal/hydrate` handler composes.
+/// What the hydrate handler composes.
 async fn hydrate(request: RequestPayload, ctx: &ExecutionContext) -> ExecutorResult<Hydration> {
     ensure_splittable(&request)?;
     let live = rehydrate_conversation(request, ctx).await?;
+    ensure_splittable(&live.enriched_request)?;
     let stream = live.original_request.stream;
     let body = RawValue::from_string(upstream_request(&live, stream)?).map_err(ExecutorError::JsonError)?;
     Ok(Hydration {
@@ -77,7 +78,7 @@ async fn hydrate(request: RequestPayload, ctx: &ExecutionContext) -> ExecutorRes
     })
 }
 
-/// What the `/internal/persist` handler composes.
+/// What the persist handler composes.
 async fn persist(
     context: String,
     upstream: UpstreamBody<'_>,
@@ -125,9 +126,8 @@ async fn a_turn_that_cannot_be_stored_is_refused() {
     let unknown = hydrate(request("hi", Some("resp_missing")), &ctx).await;
     assert_eq!(status_of(&unknown.expect_err("unknown id")), 404);
 
-    // The in-process parser defaults a missing status to `completed` and drops
-    // items it cannot read; a caller-supplied body gets neither. An unrecognized
-    // item *type* is still fine — `OutputItem` keeps a catch-all.
+    // A caller-supplied body gets none of the in-process parser's defaults. An
+    // unrecognized item *type* is still fine — `OutputItem` keeps a catch-all.
     let mut in_progress: Value = serde_json::from_str(&upstream_json("partial")).expect("json");
     in_progress["status"] = json!("in_progress");
     for body in [
@@ -140,10 +140,16 @@ async fn a_turn_that_cannot_be_stored_is_refused() {
         assert_eq!(status_of(&refused.expect_err("not storable")), 400, "accepted: {body}");
     }
 
-    // A relay that died mid-stream: `finish_stream` would call this complete.
-    let cut_short = r#"data: {"type":"response.output_text.delta","item_id":"msg_1","delta":"4"}"#;
-    let refused = persist(turn("hi", None, &ctx).await.context, UpstreamBody::Sse(cut_short), &ctx).await;
-    assert_eq!(status_of(&refused.expect_err("no terminal event")), 400);
+    let completed = r#"data: {"type":"response.completed","response":{"id":"resp_upstream","status":"completed"}}"#;
+    for sse in [
+        // A relay that died mid-stream: `finish_stream` would call this complete.
+        r#"data: {"type":"response.output_text.delta","item_id":"msg_1","delta":"4"}"#.to_owned(),
+        // A frame the accumulator could not read must not be skipped past.
+        format!("data: not-json\n\n{completed}"),
+    ] {
+        let refused = persist(turn("hi", None, &ctx).await.context, UpstreamBody::Sse(&sse), &ctx).await;
+        assert_eq!(status_of(&refused.expect_err("bad stream")), 400, "accepted: {sse}");
+    }
 
     let opened = unseal(&turn("hi", None, &ctx).await.context, KEY).expect("unseal");
     let no_id = seal(
@@ -158,8 +164,7 @@ async fn a_turn_that_cannot_be_stored_is_refused() {
     assert_eq!(status_of(&refused.expect_err("no reserved id")), 400);
 }
 
-/// Two turns that are not written but must not read as errors: a model that
-/// failed, and a retry of one already stored.
+/// A model that failed is not written, but is not a boundary error either.
 #[tokio::test]
 async fn a_turn_that_is_not_written_still_returns() {
     let ctx = exec_ctx().await;
@@ -175,17 +180,53 @@ async fn a_turn_that_is_not_written_still_returns() {
     assert_eq!(payload.status, "error", "`failed` normalizes to the error status");
     let orphan = hydrate(request("and then?", Some(&id)), &ctx).await;
     assert_eq!(status_of(&orphan.expect_err("never stored")), 404);
+}
 
+/// Until an identical retry can be proven identical, a reused id is refused.
+#[tokio::test]
+async fn reusing_a_reserved_id_is_refused() {
+    let ctx = exec_ctx().await;
     let stored = turn("What is 2+2?", None, &ctx).await;
     let context = stored.context.clone();
     let first = persist(stored.context, UpstreamBody::Json(&upstream_json("4")), &ctx)
         .await
         .expect("persist");
-    let retry = persist(context, UpstreamBody::Json(&upstream_json("4")), &ctx)
+
+    // Different content under the same id must never come back as if stored.
+    let reused = persist(context, UpstreamBody::Json(&upstream_json("5")), &ctx).await;
+    assert_eq!(status_of(&reused.expect_err("id already used")), 409);
+
+    // And the turn that was stored is untouched.
+    let (count, text) = replayed(&turn("and?", Some(&first.id), &ctx).await);
+    assert_eq!(count, 3, "stored once");
+    assert!(text.contains('4') && !text.contains('5'));
+}
+
+/// A gateway-owned tool reaches a split turn only by inheritance: the gateway
+/// stored it, and a continuation sending no `tools` picks it up during
+/// rehydration — after the request itself has already passed the check.
+#[tokio::test]
+async fn an_inherited_gateway_tool_is_refused() {
+    let ctx = exec_ctx().await;
+    let mut gateway_turn = RequestContext::from(unseal(&turn("hi", None, &ctx).await.context, KEY).expect("unseal"));
+    gateway_turn.enriched_request.tools = Some(vec![
+        serde_json::from_value(json!({"type": "web_search_preview"})).expect("gateway tool"),
+    ]);
+    let id = gateway_turn.response_id.clone();
+    persist_turn(
+        gateway_turn,
+        serde_json::from_value(answer("sure")).expect("output items"),
+        &ctx.conv_handler,
+        &ctx.resp_handler,
+    )
+    .await
+    .expect("the gateway stores turns the split path would refuse");
+
+    let error = hydrate(request("and then?", Some(&id)), &ctx)
         .await
-        .expect("a retry is not a failure");
-    assert_eq!(retry.id, first.id);
-    assert_eq!(replayed(&turn("and?", Some(&first.id), &ctx).await).0, 3, "stored once");
+        .expect_err("the stored tool is inherited during rehydration");
+    assert_eq!(status_of(&error), 400);
+    assert!(error.to_string().contains("tools"), "got: {error}");
 }
 
 #[test]
@@ -208,8 +249,7 @@ fn the_boundary_check_names_what_cannot_be_split() {
     ensure_splittable(&request("hi", None)).expect("a plain turn is splittable");
 }
 
-/// The wire form drops what it can rebuild, and the rebuild has to agree with
-/// what hydration produced — persist stores from it.
+/// The wire form drops what it can rebuild, and the rebuild must agree.
 #[tokio::test]
 async fn the_wire_context_round_trips_into_an_equal_context() {
     let ctx = exec_ctx().await;
@@ -238,8 +278,7 @@ async fn the_wire_context_round_trips_into_an_equal_context() {
     );
 }
 
-/// A context `hydrate` did not issue must not be usable: without this a caller
-/// could skip hydration and write turns under any id it chose.
+/// A context `hydrate` did not issue must not be usable.
 #[tokio::test]
 async fn a_context_this_service_did_not_seal_is_rejected() {
     let ctx = exec_ctx().await;

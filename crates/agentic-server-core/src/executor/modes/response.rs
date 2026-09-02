@@ -34,11 +34,9 @@ impl ResponseHandler {
         self.store.get(prev_id).await.map_err(ExecutorError::Storage)
     }
 
-    /// Whether a response is already stored under `response_id`.
-    ///
-    /// Split execution reserves the id before inference, so a retried persist
-    /// carries an id that may already be written; this tells the two apart
-    /// without relying on a primary-key violation.
+    /// Whether a response is already stored under `response_id`. Split execution
+    /// reserves the id before inference, so a retried persist may carry one that
+    /// is already written.
     ///
     /// # Errors
     /// Returns `ExecutorError` if the store is disabled or the query fails.

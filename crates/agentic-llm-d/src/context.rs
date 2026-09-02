@@ -1,6 +1,5 @@
-//! The wire protocol between `/internal/hydrate` and `/internal/persist`.
-//! Only this crate speaks it; core keeps the transport-neutral operations it
-//! composes.
+//! The wire protocol between `/v1alpha/responses/hydrate` and `.../persist`. Only
+//! this crate speaks it; core keeps the operations it composes.
 #![allow(clippy::result_large_err)] // `ExecutorError` is core's; boxing it is not ours to decide
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -19,8 +18,7 @@ use agentic_core::types::tools::ResponsesTool;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hydration {
     pub request: Box<RawValue>,
-    /// Sealed: echo back to `persist` unchanged. Opaque to the caller, which
-    /// cannot read or alter what it carries.
+    /// Sealed: echo back to `persist` unchanged. Opaque to the caller.
     pub context: String,
 }
 
@@ -30,8 +28,7 @@ pub struct Hydration {
 pub struct SplitContext {
     pub response_id: String,
     pub original_request: RequestPayload,
-    /// Inherited from the turn a `previous_response_id` continues — never the
-    /// request's own, which split execution rejects.
+    /// Inherited from the continued turn; the request's own is rejected.
     pub conversation_id: Option<String>,
     /// The only part of `enriched_request` that `original_request` cannot supply.
     pub effective_tools: Option<Vec<ResponsesTool>>,
@@ -83,8 +80,7 @@ pub fn ensure_splittable(request: &RequestPayload) -> ExecutorResult<()> {
     Ok(())
 }
 
-/// How long a sealed context stays valid. It only has to outlive one inference
-/// call, so this is generous rather than tuned.
+/// Only has to outlive one inference call, so generous rather than tuned.
 const CONTEXT_TTL: Duration = Duration::from_secs(600);
 const AUDIENCE: &str = "agentic-llm-d";
 
@@ -95,8 +91,7 @@ struct SealedClaims {
     ctx: SplitContext,
 }
 
-/// Seals a context so `persist` can prove it came from `hydrate`. Without this
-/// a caller could skip hydration and write turns under any id it chose.
+/// Seals a context so `persist` can prove `hydrate` issued it.
 ///
 /// # Errors
 /// [`ExecutorError::InvalidRequest`] if the token cannot be produced.

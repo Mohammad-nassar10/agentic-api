@@ -13,7 +13,7 @@ serve it. Cache-aware scoring can still prefer the engine that handled the previ
 ## The two steps
 
 `hydrate` takes the client's request, resolves `previous_response_id` against storage, and returns two things: the
-upstream request body with the history inlined and every continuation and storage field removed, and a `SplitContext`
+upstream request body with the history inlined and every continuation and storage field removed, and a sealed context
 describing the turn. The caller forwards the body to a model unchanged and echoes the context back.
 
 `persist` takes that context together with the response the model produced — either a complete JSON body, or the SSE
@@ -22,20 +22,26 @@ response envelope carrying the reserved `resp_` identifier. Nothing is re-emitte
 has already sent the frames on.
 
 `SplitContext` is the wire form of the in-process `RequestContext`. It omits the enriched request, which is already in
-flight as the request body, and the derived input items; both are rebuilt when the context comes back. Callers treat it
-as opaque.
+flight as the request body, and the derived input items; both are rebuilt when the context comes back. It travels as an
+HMAC-signed token carrying an expiry and an audience, so `persist` can prove `hydrate` issued it rather than trusting a
+caller-authored context. Callers treat it as opaque.
 
 ## Composition
 
-Neither step reimplements the flow. `hydrate` calls `rehydrate_conversation` and `upstream_request_json`, and `persist`
-calls `payload_from_upstream` and `persist_if_needed`. All four are the functions the in-process executor already uses,
-so a change to how a turn is rehydrated or stored reaches both paths at once. `split.rs` contains no parsing, no
-storage access and no request building of its own.
+Neither step reimplements the flow. `hydrate` calls `rehydrate_conversation` and `upstream_request`; `persist` calls
+`decode_upstream` and `commit`. All four are core operations the in-process executor already uses or shares, so a change
+to how a turn is rehydrated or stored reaches both paths at once. This crate contains no parsing, no storage access and
+no request building of its own.
 
 What it does contain is the boundary itself: the check for what cannot be split, the conversion between the live and
-wire context forms, and a terminal-status check. The last exists because an external caller can return a response the
-in-process flow could never produce, such as one still in progress. Storing it would hand back an identifier that could
-never be continued, so `persist` rejects it.
+wire context forms, and the sealing.
+
+Core keeps what is not specific to one consumer. `decode_upstream` is the OpenAI JSON/SSE adapter; it validates a
+caller-supplied body more strictly than the in-process parser, which defaults a missing status and drops items it
+cannot read. `commit` takes a normalized `ResponsePayload` and owns the rest of the shared behaviour:
+reserved-identifier and terminal-status validation, the conflict check on an identifier already stored, and conditional
+persistence. A response still in progress is something an external caller can return but the in-process flow never
+produces; storing it would hand back an identifier that could never be continued, so `commit` rejects it.
 
 `ensure_splittable` reuses `RequestPayload::in_process_feature`, the predicate that already decides whether the gateway
 runs the executor or passes a request through to vLLM. The passthrough proxy and the split boundary have the same
@@ -49,16 +55,17 @@ compaction input, or `context_management`. Each needs state that the in-process 
 ## The crate
 
 The endpoints are served by a separate crate and binary that depends on `agentic-server-core` and not on the gateway.
-It serves `/internal/hydrate`, `/internal/persist`, `/health` and `/ready`, and nothing else: the passthrough proxy,
-`/v1`, the WebSocket transport, upstream readiness probing and vLLM subprocess management are all absent, so the
-internal endpoints cannot be exposed on a listener that also serves `/v1`. Readiness reports whether storage answers,
-since the coordinator owns the model fleet.
+It serves `/v1alpha/responses/hydrate`, `/v1alpha/responses/persist`, `/health` and `/ready`, and nothing else: the
+passthrough proxy, `/v1`, the WebSocket transport, upstream readiness probing and vLLM subprocess management are all
+absent, so these endpoints cannot be exposed on a listener that also serves `/v1`. Readiness reports whether storage
+answers, since the coordinator owns the model fleet.
 
 ## Discussion points
 
-The `/internal` endpoints do not authenticate their caller yet, so restricting them is a network-layer concern today.
-The coordinator holds the caller's bearer token, so forwarding it to the existing OIDC layer is one option;
-authenticating the coordinator as a workload is another. Either way, per-response authorization needs an owner the
-schema does not yet record. A retried `persist` conflicts with the response-identifier primary key and returns a server error rather than
-the turn it already stored. Request fields that `RequestPayload` does not model are dropped rather than forwarded,
-which narrows what reaches vLLM compared with plain passthrough.
+The endpoints authenticate the calling workload with a shared token. That identifies a workload and not a tenant, so
+per-response authorization still needs an owner the schema does not record
+([#107](https://github.com/vllm-project/agentic-api/issues/107)); network policy remains defence in depth. A retried
+`persist` returns `409` rather than the turn it already stored, and the check that detects the reuse is a read before
+the write, so concurrent retries can still race. The sealed context carries the original request and base64 expands it,
+so hydrate's body limit admits turns whose persist body exceeds the same limit. Request fields that `RequestPayload`
+does not model are dropped rather than forwarded, which narrows what reaches vLLM compared with plain passthrough.

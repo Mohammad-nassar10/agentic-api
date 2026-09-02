@@ -127,9 +127,8 @@ where
 
 impl RequestPayload {
     /// Names the feature in this request that only the in-process executor
-    /// implements, if any. Such a request cannot be served by the passthrough
-    /// proxy or by split execution; the returned name lets a caller say which
-    /// feature forced its hand.
+    /// implements, if any — neither the passthrough proxy nor split execution
+    /// can serve it.
     #[must_use]
     pub fn in_process_feature(&self) -> Option<&'static str> {
         if self.conversation_id.is_some() {

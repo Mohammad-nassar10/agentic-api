@@ -19,8 +19,6 @@ use crate::types::request_response::{RequestPayload, ResponsePayload};
 const GATEWAY_TOOL_ALIASES_ENV: &str = "MESSAGES_GATEWAY_TOOL_ALIASES";
 
 /// Context built by `rehydrate_conversation`, threaded through the execute pipeline.
-///
-/// Converts to and from [`SplitContext`] when a turn crosses a process boundary.
 #[derive(Debug)]
 pub struct RequestContext {
     /// Untouched original request from the client.

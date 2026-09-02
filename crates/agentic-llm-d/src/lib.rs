@@ -12,28 +12,25 @@ use axum::{Router, middleware};
 
 use agentic_core::executor::ExecutionContext;
 
-/// All the endpoints need. The gateway's `AppState` carries eight more fields,
-/// every one for machinery backend mode does not run.
+/// All the endpoints need — far less than the gateway's `AppState`.
 #[derive(Clone)]
-pub struct InternalState {
+pub struct BackendState {
     pub exec_ctx: Arc<ExecutionContext>,
-    /// Seals the context between hydrate and persist, so a caller cannot forge
-    /// one. Required: the endpoints have no other proof of where a turn began.
+    /// Seals the context between hydrate and persist.
     pub signing_key: Arc<Vec<u8>>,
-    /// Shared secret every `/internal` caller must present. Required: these
-    /// endpoints read and write conversation history.
+    /// Shared secret every split-route caller must present.
     pub api_token: Arc<String>,
 }
 
 /// The whole surface: two split-execution endpoints and two probes.
-pub fn build_internal_router(state: InternalState) -> Router {
+pub fn build_router(state: BackendState) -> Router {
     // Probes stay open so an orchestrator can check liveness without the secret.
     let probes = Router::new()
         .route("/health", get(handler::health))
         .route("/ready", get(handler::ready));
-    let internal = Router::new()
-        .route("/internal/hydrate", post(handler::internal_hydrate))
-        .route("/internal/persist", post(handler::internal_persist))
+    let responses = Router::new()
+        .route("/v1alpha/responses/hydrate", post(handler::hydrate))
+        .route("/v1alpha/responses/persist", post(handler::persist))
         .route_layer(middleware::from_fn_with_state(state.clone(), handler::require_token));
-    probes.merge(internal).with_state(state)
+    probes.merge(responses).with_state(state)
 }
