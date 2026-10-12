@@ -697,12 +697,12 @@ async fn test_public_persist_steps_honor_the_storage_policy() {
                 "status": "completed", "content": [{"type": "output_text", "text": "public answer"}]}]
         }))
         .expect("completed payload");
-        persist_response(
+        Box::pin(persist_response(
             payload,
             ctx,
             exec_ctx.conv_handler.clone(),
             exec_ctx.resp_handler.clone(),
-        )
+        ))
         .await
         .expect("persist_response");
         assert_eq!(
