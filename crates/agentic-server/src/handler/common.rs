@@ -1,18 +1,21 @@
 use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::body::Body;
 use axum::extract::Request;
 use axum::http::HeaderMap;
 use axum::response::Response;
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use http::StatusCode;
 use serde::de::DeserializeOwned;
 use tracing::warn;
 
 use agentic_core::executor::{BoxStream, ExecutorError};
 use agentic_core::proxy::{
-    ProxyAuth, ProxyBody, ProxyRequest, ProxyResponse, error_response_for_auth, proxy_request_with_path,
+    ProxyAuth, ProxyBody, ProxyRequest, ProxyResponse, ProxyStreamRequest, error_response_for_auth,
+    proxy_request_with_path, proxy_stream_with_path,
 };
 
 use crate::app::AppState;
@@ -70,14 +73,18 @@ pub(super) async fn read_bytes(body: Body, limit: NonZeroUsize) -> Result<Bytes,
 
 #[allow(clippy::result_large_err)]
 pub(super) async fn read_bytes_with_auth(body: Body, auth: ProxyAuth, limit: NonZeroUsize) -> Result<Bytes, Response> {
-    axum::body::to_bytes(body, limit.get()).await.map_err(|_| {
-        convert_response(error_response_for_auth(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "body_too_large",
-            "request body too large",
-            auth,
-        ))
-    })
+    axum::body::to_bytes(body, limit.get())
+        .await
+        .map_err(|_| body_too_large(auth))
+}
+
+fn body_too_large(auth: ProxyAuth) -> Response {
+    convert_response(error_response_for_auth(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "body_too_large",
+        "request body too large",
+        auth,
+    ))
 }
 
 /// Forward one request body to `path` on the configured upstream, unchanged.
@@ -103,6 +110,60 @@ pub(super) async fn passthrough(state: &AppState, req: Request, path: &'static s
         )
         .await,
     )
+}
+
+/// Forward one request to `path` on the configured upstream, streaming its body as it arrives.
+///
+/// For uploads the gateway does not own, such as multipart audio: the body is never held in
+/// memory whole, yet the same request-size limit applies. A declared length over the limit is
+/// rejected before the upstream is called; an undeclared one is cut off once it passes it.
+pub(super) async fn stream_passthrough(state: &AppState, req: Request, path: &'static str) -> Response {
+    let limit = state.max_request_body_size.get();
+    let (parts, body) = req.into_parts();
+    let content_length = parts
+        .headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok()?.parse::<u64>().ok());
+    if content_length.is_some_and(|length| length > u64::try_from(limit).unwrap_or(u64::MAX)) {
+        return body_too_large(ProxyAuth::OpenAiBearer);
+    }
+
+    let exceeded = Arc::new(AtomicBool::new(false));
+    let response = proxy_stream_with_path(
+        ProxyStreamRequest {
+            headers: parts.headers,
+            body: limited_body(body, limit, Arc::clone(&exceeded)),
+            content_length,
+            query: parts.uri.query().map(str::to_owned),
+        },
+        path,
+        ProxyAuth::OpenAiBearer,
+        &state.proxy_state,
+    )
+    .await;
+    // The upstream request fails once the limit trips; report that as the client's error.
+    if exceeded.load(Ordering::Acquire) {
+        return body_too_large(ProxyAuth::OpenAiBearer);
+    }
+    convert_response(response)
+}
+
+/// Stream `body` while counting its bytes, failing once more than `limit` have arrived.
+fn limited_body(
+    body: Body,
+    limit: usize,
+    exceeded: Arc<AtomicBool>,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
+    let mut received = 0_usize;
+    body.into_data_stream().map(move |chunk| {
+        let chunk = chunk.map_err(std::io::Error::other)?;
+        received = received.saturating_add(chunk.len());
+        if received > limit {
+            exceeded.store(true, Ordering::Release);
+            return Err(std::io::Error::other("request body too large"));
+        }
+        Ok(chunk)
+    })
 }
 
 #[allow(clippy::result_large_err)]
