@@ -91,8 +91,8 @@ default. These routes are stateless pass-through, with the same authentication a
 
 HTTP Responses requests use the OpenAI-compatible Responses shape. Requests
 with `store=true`, `previous_response_id`, `conversation`, any non-function
-tool, `multi_agent.enabled`, tool-search state, compaction input, or
-`context_management` run through the executor. Other stateless `store=false`
+tool, an async tool or replayed async call, `multi_agent.enabled`, tool-search state,
+compaction input, or `context_management` run through the executor. Other stateless `store=false`
 requests are passed directly to the configured vLLM backend. A `store=false`
 request that continues a stored response is hydrated from that response but is
 not stored itself: its id can be neither retrieved nor used as `previous_response_id`.
@@ -112,6 +112,69 @@ requests require `store: true`, reject `max_tool_calls` and reasoning summaries,
 and run over HTTP JSON and SSE only; the WebSocket transport rejects them.
 Continue the agent tree with `previous_response_id`. See
 [HTTP multi-agent execution](https://github.com/vllm-project/agentic-api/blob/main/ARCHITECTURE.md#http-multi-agent-execution).
+
+#### Async client tools
+
+`async: true` on a `function` or `custom` tool, including a function member of a
+`namespace`, lets the model keep working after it calls that tool; the client returns
+the output later on the original `call_id`, as in
+[OpenAI async tool calling](https://developers.openai.com/api/docs/guides/async-tool-calling).
+Calls to async tools carry `async: true`, in the response and in the streamed
+`response.output_item.added`/`done` items. Requests that declare an async tool, or replay
+an async call, always run through the executor; the llm-d split-execution backend rejects them.
+
+The gateway matches the recorded OpenAI behavior:
+
+- A follow-up request may omit the outputs of pending async calls; a synchronous call
+  left unanswered is still rejected (`No tool output found for function call <id>.`).
+- An async call accepts repeated and conflicting outputs, and the model receives each one.
+  An output whose `call_id` matches no call returns `400`, `param: input`,
+  `No tool call found for function call output with call_id <id>.`
+- Whether a call is async is read from the call itself, so re-declaring the tool without
+  `async` does not change a pending call.
+- `async` on a namespace itself, on `shell`, on `tool_search`, or on a gateway-executed tool
+  returns `400`, `code: unknown_parameter`, `param: tools[<index>].async`.
+- Multi-agent mode with `parallel_tool_calls: true` and an async tool returns `400`,
+  `code: unsupported_value`, `param: multi_agent`. The gateway defaults
+  `parallel_tool_calls` to `false`, so only an explicit `true` conflicts.
+- A response whose only client calls are async continues: the model answers in the same
+  response. A synchronous client call in the same round ends the response, as before.
+
+A model served by vLLM stops at a tool call and does not know `async`. The gateway
+therefore runs another inference round with the call pending, and adds two hints to the
+request it sends the model server: the async tool's description says that it runs in the
+background, and a `developer` note follows each async call whose output has not arrived.
+The note names the tool and `call_id` only when each is a plain identifier.
+Without them the model tends to invent the pending result. The gateway does not store or
+return the hints: responses to a request with async tools echo the client's own tool
+declarations. The model's own reasoning output can still quote or paraphrase a hint.
+After compaction, by any of its triggers, an async call whose output has not arrived stays
+in the model context, so its output can still arrive. An output delivered in the request that
+compacts is stored with the summarized history, so its call is no longer reported as pending,
+and a further output for that call reaches the model after the call. This holds over HTTP
+with `previous_response_id`, over a WebSocket session, and in multi-agent runs for calls the
+gateway emitted; in multi-agent mode, a further output for an async call that the client
+supplied in its own input is rejected with `400`. If the model
+keeps calling async tools instead of answering, the gateway stops after two such rounds in a
+row.
+
+In multi-agent mode, a late async output is new information for the agent whose call it
+answers. In a continuation request it starts a new root turn; in a live WebSocket run, only
+once the root has finished its turn. A subagent that has finished its turn (not one that was
+interrupted or failed) starts a new turn as soon as `max_concurrent_subagents` allows, and its
+answer reaches its parent as mail; an idle root reads that mail at its next turn. An agent
+that is still busy reads the output at its next turn. When the output arrives during the
+agent's last round, that round ran without it, so the agent runs once more after the round
+ends its turn (a subagent once a slot is free). For the root this means a streamed response can
+contain a message with `phase: final_answer` followed by the root's next answer.
+
+Differences from OpenAI:
+
+- `async` is accepted for every served model; the gateway does not know which models
+  support it natively, and the emulation above does not require support.
+- When the model emits an async call after a gateway-executed tool call in the same
+  round, the stream delivers the async call after that tool completes, keeping output
+  indexes in order. Async calls before or without gateway calls stream immediately.
 
 `prompt_cache_key` is forwarded unchanged on direct and executor-backed HTTP
 requests, WebSocket requests, gateway tool rounds, automatic compaction,
@@ -270,9 +333,68 @@ replay the full item history or a compacted window; an unstored response ID retu
 loaded from durable storage. Explicit `conversation` requests retain the durable
 Conversations API behavior.
 
-A failed same-lane continuation evicts its referenced cached parent. Failed forks
+A failed ordinary same-lane continuation evicts its referenced cached parent. Failed forks
 preserve the source lane's parent. Admission rejections (429) preserve existing
 checkpoints and accepted queued work. Parent lookup happens when execution begins.
+
+For a single-agent response on the current connection, send a steering update
+while generation or tool execution is in progress:
+
+```json
+{
+  "type": "response.steer",
+  "previous_response_id": "resp_parent",
+  "input": "Keep the work so far, but use Fahrenheit and summarize briefly."
+}
+```
+
+Steering accepts text (including empty text) or a nonempty array of user messages
+using the usual input text and image content types. Images require a vision-capable backend; file input
+is not supported by the gateway. The target determines
+the lane; do not add `stream_id` or response settings to the steering message.
+`response.steer.accepted` returns a distinct steering ID. It acknowledges retained
+input; the successor's `response.created` commits that input to a new response.
+Multiple accepted updates are applied in acceptance order. Earlier output is
+preserved, active output items and started tool work finish, and an interrupted
+parent ends with `response.incomplete` and reason `steered`. Natural completion
+may win that race. An eligible completed parent can also accept steering.
+
+If the parent needs client-executed function or custom-tool output,
+`response.steer.pending` lists the required call IDs. Submit a normal
+`response.create` in the same lane with the parent's `previous_response_id` and
+all required outputs. The server prepends the accepted steering; do not resend it.
+An invalid output submission preserves pending steering so a corrected submission
+can succeed. The explicit create uses its own settings and defaults. When no
+client output is needed, the server creates a successor automatically using the
+parent's effective settings and fresh response budgets.
+
+`response.steer.failed` returns the original submitted input and a failure code;
+accepted input that fails before successor creation also returns its steering ID.
+After successor creation, later execution failure does not make that input
+replayable. Control events can follow a parent's terminal event. Disconnect
+discards unapplied steering, even for a stored parent; storage remains available
+for ordinary continuation. Completed targets expire after 60 seconds and may be
+evicted sooner under capacity pressure. Each target permits 32 queued updates;
+the connection bounds accepted steering echoes at 12 MiB separately from ordinary
+request and checkpoint budgets. Input-budget overflow returns `response.steer.failed`
+with `too_many_pending_steers` and the submitted input. A separate 12 MiB budget bounds
+retained settings, including targets without accepted steering. Settings are released
+when the connection observes a newer `response.created` on the same lane, unless an
+accepted batch still needs them. Targets whose settings exceed the remaining budget
+continue normally but reject steering with `response_not_active`; ordinary continuation
+is unaffected.
+A separate 12 MiB allowance bounds failure echoes awaiting delivery; exhausting
+failure-delivery capacity closes the connection.
+
+Steering is local to generating, single-agent WebSocket responses. Multi-agent
+responses, conversation-bound requests, compaction/context-management requests,
+and unsupported client call kinds are rejected. Function, custom-tool, shell, and
+client-executed tool-search calls report their required output stubs in
+`response.steer.pending`; normal output validation still applies. It uses complete upstream item
+lifecycle events as safe boundaries; a truncated or ambiguous stream cannot
+establish that started work has settled. Backend model capability is not inferred
+from its name. Non-generating prewarm responses and HTTP/SSE steering are outside
+this interface; HTTP continues to support ordinary response continuation.
 
 Set `stream_id` to a string containing 1 to 256 characters to multiplex
 responses over one connection. Requests with different `stream_id` values can
@@ -291,8 +413,7 @@ measure total process memory. Upstream SSE lines, the per-request retained respo
 budget, and outbound events follow the `[responses]` limits in `config.toml`
 (`max_upstream_sse_line_bytes`, `max_retained_bytes`, and `max_stream_event_bytes`;
 defaults 16 MiB, 8 MiB, and 16 MiB). Every outbound WebSocket event, including
-`stream_id`, counts toward `max_stream_event_bytes`. Multi-agent requests are
-not supported on this transport. Local `generate: false` requests validate both lifecycle events
+`stream_id`, counts toward `max_stream_event_bytes`. Local `generate: false` requests validate both lifecycle events
 before storing the response or emitting either event. OIDC identity expiry is
 checked again when queued work starts, including work in the default lane;
 expired work receives a tagged `invalid_token` event without reaching inference.

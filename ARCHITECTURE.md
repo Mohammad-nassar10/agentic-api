@@ -189,7 +189,7 @@ building `ExecuteRequest`, preserving strict validation for in-process execution
 
 `GET /v1/responses` upgrades to a WebSocket. Structurally this is not a one-shot
 handler like the HTTP routes — `responses_ws_loop` is a long-lived session loop that
-decodes typed create and injection messages and uses `ExecuteRequest::run_retained()`
+decodes typed create, injection, and steering messages and uses `ExecuteRequest::prepare_retained()`
 to drive the same inference/tool loop and persistence APIs as HTTP. Requests with distinct
 `stream_id` values run concurrently, while requests in the same lane remain FIFO;
 requests without a `stream_id` share a default FIFO lane. The session admits at most
@@ -198,7 +198,124 @@ force `stream: true` and honor the requested `store` value. Because axum's built
 doesn't wait for upgraded connections, `AppState` carries a separate
 `WebSocketTracker` so shutdown can drain in-flight sessions. `connection.rs` owns socket
 reading, writing, and shutdown; `multiplexer.rs` owns bounded create admission and lane FIFO;
-`control.rs` owns retained response routes and injection tasks.
+`control.rs` owns retained response routes and bounded task lifetimes. Its private
+`control/injection.rs` handles live client tool outputs; `control/steering.rs` owns
+accepted-batch lifecycle, pending outcomes, and successor handoff. Its private
+`steering/admission.rs` decodes and resolves submissions, validates eligibility,
+reserves capacity, and delivers acceptance or rejection against the same route state.
+Lane advancement and automatic scheduling return `Result<(), WsError>`; successful idle scheduling is
+`Ok(())`. The socket loop owns the disconnect decision and logs scheduling or task-join failures.
+An automatic admission failure closes the unprepared target before its deferred cleanup runs.
+
+Generating creates prepare the existing executor before starting a gated retained
+owner. `PreparedRetainedResponse::start_gated()` allocates the response task;
+the connection registers its route and relay before `ResponseRunOwner::activate()`
+releases execution. The owner's `ResponseRunState` transitions from
+`AwaitingRegistration` to `Running` to `Joined`. Ordinary core callers use
+`PreparedRetainedResponse::start()` with `ResponseStartMode::Immediate`, which
+creates no activation channel. Cancellation and joining remain separate operations.
+
+`response.steer` targets a generating, single-agent response on the same
+connection. The target supplies its lane; the steering envelope has no
+`stream_id` or response settings. HTTP/SSE keeps ordinary Responses continuation
+and exposes no steering operation. Multi-agent tool outputs use injection;
+multi-agent steering is unsupported. Conversation-bound requests, compaction/context management,
+unsupported client-call obligations, and non-generating prewarm targets are
+outside the steering interface. Support is not inferred from a model-name prefix.
+
+Validated `SteeringInput` wraps `ResponsesInput` and reuses its user messages and
+text/image content types. Shared input types still represent files, but file execution is not supported
+or qualified by this steering suite. `request.rs` checks original envelope/message fields
+before shared decoding, while `SteeringInputEcho` retains bounded original JSON
+for failed outcomes. This preserves rejected fields and explicit nulls that shared
+message decoding can discard or normalize. Accepted input becomes ordinary user
+`InputItem`s in the successor, not an output slot in the running response.
+`ResponsesInput::into_canonical_items()` in `types/io/input/conversions.rs`
+preserves submitted item variants; `normalized_model_input()` still runs at the
+ordinary upstream request boundary.
+
+The existing `SteeringTarget` owns `SteeringState` in `control.rs`. An optional
+`SteeringBatch` groups its accepted queue, original-input echoes, and parent pin.
+The state also owns an optional settings snapshot with a separate connection-level
+12 MiB reservation, acquired even for unsteered targets. Periodic expiry and steering
+admission release superseded snapshots only after observing a newer creation receipt
+on the same lane; accepted batches keep theirs through commitment or failure. Settings
+overflow disables steering for that target without cancelling the response. Closing
+the state drops its settings reservation and transfers or drops the whole batch; terminal
+paths do not clear its resources independently. Its admission
+lifecycle is independent of the response task and terminal delivery:
+
+| `SteeringPhase` | Meaning |
+| --- | --- |
+| `Running` | Parent execution is active; accepted updates wait for its safe completion boundary. |
+| `Ready` | Parent execution has joined; continuation can be prepared when required client outputs are available. |
+| `Reserved` | A validated successor owns the sealed batch; its publication decides commitment or failure. |
+| `Closed` | Further admission is closed; retained input is released on commitment or returned through failed outcomes. |
+
+Parent completion advances `Running` to `Ready`, so an eligible completed parent
+can still accept steering. Fresh batch reservation advances `Ready` to `Reserved`;
+publication or fenced failure closes it. Preparation checks the phase both before
+and after its awaits. An automatic admission/preparation failure closes an
+unreserved target before asynchronous cleanup can race another attempt. Delayed
+completion callbacks cannot reopen a reserved or closed target. Route lookup also
+checks for a newer published response in the same lane; another lane does not
+supersede or consume the target's accepted input.
+
+`SteeringQueue` in `executor/session/steering.rs`, re-exported by `session.rs`, owns
+ordered accepted input and its byte reservations. A `ResponseCheckpointPin` retains the exact parent across failed
+continuation attempts through the unified
+`with_session(session, Option<&ResponseCheckpointPin>)`
+API. Preparation copies canonical input without consuming admission; a consuming
+`SteeringSuccessorReservation` checks the complete ordered batch again before
+sealing it. A new admission during preparation invalidates that snapshot and
+returns both owners for fresh preparation. Gated startup transfers the queue to
+`SteeringSuccessorPublication`, which commits only with its exact sink's
+`ResponseCreatedReceipt`, recorded after bounded enqueue and sequence commitment.
+This proves publication to the relay queue, not peer receipt. Pre-creation failure
+recovery requires cancelling and joining execution, then checking creation again.
+`fail_before_creation()` releases the uncommitted canonical batch; the adapter
+already owns the original inputs and IDs for failure delivery. Later failure after
+creation cannot return or replay committed steering.
+
+The retained sink's steering signal wakes `AgentPipeline` only at a safe item
+boundary. The existing synchronous accumulator owns the completion proof described
+below; the engine drains admitted gateway-executed tool batches before stopping
+further inference. An intentional cut ends the parent as incomplete with reason
+`steered`; natural completion can win. A completed client-executed call keeps the
+ordinary completed parent and its required-output obligation.
+
+The adapter uses the existing pending-call scanner to emit
+`response.steer.pending` with function, custom, shell, and client tool-search output stubs. A matching same-lane
+`response.create` supplies all required outputs without resending steering.
+Pending stubs use the pinned parent's public tool declarations to distinguish custom and shell calls from their
+normalized model-facing function representation. Namespaced functions retain their function obligation.
+Rejected outputs preserve the queue and pinned parent for a corrected attempt;
+partial rejected batches are not accumulated. Accepted updates are prepended in
+order before the explicit create's input. That create uses its own settings and
+defaults. Ordinary continuations that explicitly replace the tool list also select their own tool choice
+or its default; a removed tool cannot retain the parent's forced selector. When no client output is required,
+an automatic successor inherits the
+immutable snapshot captured by `RequestPayload::continuation_settings()`, with
+fresh execution budgets. The snapshot excludes canonical input and parent/conversation
+routing. Active tool-search preparation restores this snapshot's tools from the public
+effective catalog, including deferred definitions, rather than its private inference view.
+Original configuration qualifies conversation and compaction restrictions
+before those fields are removed.
+
+Each target admits at most 32 steering inputs, with a 65-entry ordered outcome
+queue and a shared 12 MiB connection budget for accepted raw input echoes and settings.
+Settings are charged on first acceptance and refunded on successor publication or failure;
+ordinary responses do not consume this budget. Unaccepted settings snapshots remain
+bounded by the 128-route cap, inbound request ceiling, and route expiry. Only accepted
+steering pins checkpoints beyond the session's ordinary latest-parent retention.
+Overflow returns a routed `response.steer.failed` with `too_many_pending_steers`.
+A separate 12 MiB allowance bounds failure echoes when the accepted-input budget is
+full; outcome queue or failure-delivery exhaustion remains a transport overload.
+`response.steer.accepted` acknowledges retained ownership, not application.
+Typed accepted/pending/failed outcomes reuse `ResponseEventSink` and its sequence/flush barriers,
+including after terminal delivery. Routes with accepted input remain retained;
+unapplied input is disposed with the connection. Other lanes cannot consume it.
+Superseded targets reject further steering rather than redirecting input.
 
 WebSocket session admission allows multi-agent configuration with `store: true`,
 including configuration inherited from a stored agent tree. The common multi-agent
@@ -207,7 +324,7 @@ register connection-local routes before their first event is relayed. Injection 
 create-lane FIFO and submits typed batches to the core `RunControl`; only the coordinator
 validates call ownership and mutates agent histories.
 
-`types/websocket.rs` owns the flat create/inject client envelope; create flattens the
+`types/websocket.rs` owns the create/inject/steer client envelopes; create flattens the
 shared `RequestPayload` and adds `generate` and `stream_id`. Injection accepts typed
 function, shell, custom-tool, and discovery outputs. OpenAI duplex recordings establish
 live function, shell, and discovery acceptance and preservation of custom outputs in
@@ -243,8 +360,19 @@ client input after admission stops. Admitted acknowledgements retain their deliv
 Non-generating prewarm creates use local completion and apply continuation input through
 the core's agent ownership validation before committing the updated tree, without inference.
 
-OpenAI/gateway duplex recordings and deterministic tests cover the workflows and active
-edge cases above. Full replay of independently recorded model and hosted-tool dependencies
+OpenAI/gateway duplex recordings and deterministic tests cover injection workflows
+and active edge cases. Steering has four categories recorded against both OpenAI and the gateway. The
+[gateway WebSocket tests](crates/agentic-server/tests/responses_websocket_test.rs), including held built-in work,
+required-output recovery, connection lifetime and successor publication failures, also compare the captured
+causal contracts and replay recorded client workflows through real handlers with local model dependencies.
+Those dependencies are explicitly synthetic: public duplex recordings do not contain upstream model HTTP
+requests. A core executor companion replays captured interpreter work through the real tool supervisor with
+a controlled provider. UUIDs, generated prose, token usage and model-dependent call counts are not parity keys.
+Recorded gateway defects and probes that missed their prerequisites are classified separately; fixing the
+gateway does not rewrite the original evidence. See the
+[cassette recording guide](crates/agentic-server-core/tests/cassettes/README.md#mid-turn-steering-exploration).
+Synthetic tests do not establish real-backend parity or load performance.
+Full replay of independently recorded model and hosted-tool dependencies
 and comparative resource measurements remain follow-up work; this implementation does
 not advertise complete transport conformance.
 
@@ -272,22 +400,37 @@ not attempt to write a response.
 
 ### Opt-in core continuation sessions (`executor/session.rs`)
 
-Core callers can use `ExecuteRequest::with_session` or `rehydrate_in_session` to
+`session.rs` owns session-group admission and idle-slot lifecycle. Its private
+`session/checkpoint.rs` owns checkpoints, pins, and continuation leases;
+`session/steering.rs` owns accepted input, successor reservations, and publication.
+The public types remain re-exported through `executor::session`.
+
+Core callers can use `ExecuteRequest::with_session(session, pin)` or `rehydrate_in_session` to
 retain response state without durable storage. The WebSocket multiplexer owns one
 `ResponseSessionGroup` per connection and keeps one session per lane, including idle
 lanes. No-session HTTP and split execution keep their existing behavior.
+
+`pin: None` uses ordinary parent lookup. `Some(&ResponseCheckpointPin)` calls
+`begin_pinned` with the exact owning session and `previous_response_id`, including
+after a failed attempt has evicted the ordinary cache. Pinned attachment rejects
+explicit conversation binding. `pin_response` shares the immutable latest checkpoint
+and its existing byte reservation without occupying an execution slot. The pin
+survives cache eviction but cannot reopen a closed session or retarget the parent.
+Steering owns the pin through successor commitment or failure cleanup.
 
 The connection retains at most 128 lanes (including the default lane), 32,768 items
 and 16 MiB per checkpoint, and 32 MiB of aggregate serialized checkpoints. These are
 retention ceilings, not measured process-memory bounds. New lanes receive an
 immediate 429 once the lifetime lane limit is reached. Request-count and request-byte
 overloads also return immediate 429 responses without mutating retained state, so
-rejected work cannot invalidate an earlier accepted queued continuation. Other
-validation errors execute in lane order and evict only a matching referenced parent
-when routing is valid. Parent lookup happens when execution begins; accepted queues
-do not reserve parent snapshots. Existing fork and execution-failure eviction rules
-still apply. Disconnect aborts and joins request tasks, waits for active leases to
-release pinned state, and drops the entire connection group before the close handshake.
+rejected work cannot invalidate an earlier accepted queued continuation. Ordinary
+continuation validation errors execute in lane order and evict only a matching
+referenced parent when routing is valid. Parent lookup happens when execution begins; accepted queues
+do not reserve parent snapshots. Accepted steering separately retains its exact
+parent pin and input across rejected matching continuations. Existing ordinary fork
+and execution-failure eviction rules still apply. Disconnect aborts and joins
+request tasks, waits for active leases to release pinned state, and drops the entire
+connection group before the close handshake.
 
 A `ResponseSession` owns one latest canonical checkpoint and one execution slot.
 The executor pins a parent before inference and publishes completed or incomplete
@@ -455,7 +598,15 @@ access happen — those live in `tool/`, `executor/`, and `storage/` respectivel
   that one internal type in `tool/normalize.rs`, which delegates to per-type handlers.
   Types own the shape; tool owns what it means.
 - **`types/messages/`** — a separate, parallel type layer for the Anthropic Messages
-  API (`MessagesRequest`, `ContentBlock`, etc.). `tool_seam.rs` is the pure, I/O-free
+  API (`MessagesRequest`, `ContentBlock`, etc.). `tools.rs` classifies declarations
+  as function tools, supported native web search/fetch tools, or opaque provider
+  tools. Supported native variants retain their original version from the shared
+  capability tables in `tools/versions.rs`; classification and request validation use
+  those same tables. Unknown versions retain their discriminator and extension fields
+  without becoming supported native versions.
+  New supported kinds extend the enum and its explicit deserialization/serialization
+  mapping, then add the corresponding tool-layer conversion and validation.
+  `tool_seam.rs` is the pure, I/O-free
   adapter for `tool_use`/`tool_result` blocks and the gateway-ownership map; the
   declarations themselves are mapped by `tool::registry_tools` into the tool layer's
   `ToolDeclaration`, so both APIs build a `ToolRegistry` through one path without the
@@ -551,14 +702,34 @@ call inference, run the tool loop, persist. `agentic-server` never reaches past 
   discovery lifecycle output. After stored history and the new request input are
   combined, `pending_calls.rs` validates the complete continuation's function/custom
   call sequence. Every call and call output must have a non-empty `call_id`; call IDs
-  must be unique across the sequence; and each output must resolve exactly one
-  currently pending call of the same item kind. An output without a pending call, a
-  second output for an already resolved call, or a function/custom kind mismatch is an
-  invalid request rather than evidence that the call was resolved. Valid unresolved
-  calls remain ordered by their original emission, and the first unresolved
-  client-executed call produces the existing missing-output error. Gateway-executed
-  built-in tool calls are resolved and recorded within their originating round, so
-  they do not remain pending at this boundary.
+  must be unique across the sequence; and each output must resolve a call of the same
+  item kind. An output whose `call_id` matches no call is rejected with the `OpenAI`
+  unknown-call error; a second output for a resolved synchronous call or a
+  function/custom kind mismatch is an invalid request rather than evidence that the
+  call was resolved. Valid unresolved calls remain ordered by their original emission,
+  and the first unresolved synchronous client-executed call produces the existing
+  missing-output error. An async call (`async: true` on the call item) may stay
+  unresolved and accepts repeated outputs; it ends neither the resolved prefix used by
+  compaction nor the continuation. A compaction window (`model_items`,
+  `canonical_session_history`) shows the model an async call that was still open at its
+  checkpoint. Retained histories (`retain_window`, a session whose history compaction
+  replaces, and a multi-agent compaction, before its compaction item) also keep every async
+  call and the last output that answers it, outside the model view, so a further output still
+  finds its call while repeated outputs do not accumulate. A compacted call's public form
+  comes from stored history, not from the current tool declarations.
+  Compaction replaces the request's own items, so it stores some of them again, as the
+  request supplied them. Before the compaction item (the answered call and its output leave the
+  window together) go outputs that answer calls made before the request, and the request's own
+  answered async calls with the last output for each; after it go the async calls the request
+  made that are still open. A call already stored keeps its place, so no item or `call_id`
+  repeats. Multi-agent runs route outputs through the pending-call ledger, which knows only
+  the calls the gateway emitted, so there a further output for an async call the client
+  supplied itself is rejected, with or without compaction. An async call answered before the
+  checkpoint returns to the model view when a further output for it arrives after the
+  checkpoint.
+  Gateway-executed built-in tool calls are resolved and
+  recorded within their originating round, so they do not remain pending at this
+  boundary.
 - **`upstream.rs`** — the narrow adapter between inference transport and the pipeline.
   It builds `UpstreamRequest`s, snapshots registry classification facts into an owned
   `TranslationContext`, passes the shared retained-data budget into ingestion, and
@@ -595,8 +766,11 @@ call inference, run the tool loop, persist. `agentic-server` never reaches past 
   `multi_agent/pending_calls.rs` retains each client call's originating agent, turn and
   kind. It validates output batches before mutation, retains accepted outputs until
   transfer to canonical context, and keeps resolved IDs for duplicate detection.
-  Acceptance by this table does not itself resume an agent. It complements the
-  existing single-history rehydration validator; neither public error mapping nor
+  An async call's owner record says so: its owner does not wait for it
+  (`awaiting_outputs` lists only synchronous calls), and repeated outputs for it are
+  queued and transferred in order. Acceptance by this table does not itself resume an
+  agent or decide visibility for superseded turns. It complements the existing
+  single-history rehydration validator; neither public error mapping nor
   transport-specific batch policy is defined by it.
   `multi_agent/control.rs` provides opt-in live input through `RunControl::channel`
   and `ExecuteRequest::with_run_control`. It requires a stored, streaming multi-agent
@@ -604,9 +778,18 @@ call inference, run the tool loop, persist. `agentic-server` never reaches past 
   and at most 32 outstanding commands, including unread decisions. Adapters must keep
   draining response events while awaiting decisions. The coordinator validates the
   whole batch, transfers outputs into canonical histories, invalidates stale compaction
-  generations, and resumes a waiting owner only after all of its calls are resolved.
-  Interrupted owners retain input without being restarted. Without a control endpoint,
-  HTTP execution still completes at the client-output boundary.
+  generations, and resumes a waiting owner only after all of its synchronous calls are
+  resolved. A late async output owned by the root resumes an idle root with a fresh turn
+  when it arrives live, and any settled root in a continuation request. An idle agent with a
+  client output after its last produced item starts a fresh turn (`resume_unread_agents`) when
+  the run starts, after live input, and whenever a turn settles or is interrupted. This covers
+  an output that arrived while the agent's last round ran on older input: the round completes,
+  the agent settles, and it starts again to read the output. A subagent starts only while
+  `max_concurrent_subagents` allows (the root is not counted), and its answer then reaches its
+  parent as mail. The rule reads stored history, so an output that arrives at the limit waits
+  only for a free slot. A busy or waiting owner reads the output at its next turn. Interrupted
+  and failed agents, and live interrupted owners, retain input without being restarted.
+  Without a control endpoint, HTTP execution still completes at the client-output boundary.
   Finalization closes admission and rejects queued commands synchronously. `Finalizing`
   is distinct from successful persistence; a lost reply is an execution failure with
   unknown acceptance, never permission to retry silently. This core seam does not yet
@@ -848,11 +1031,13 @@ mark with it rather than add a second one.
 
 `ResponseAccumulator` owns validation, response lifecycle, typed output slots, delta
 folding, terminal error/incomplete state, usage, and final `ResponsePayload` assembly.
-`slot.rs` owns active/completed lifecycle and identity bindings, `identity.rs` extracts
-semantic identities, and `json.rs` contains strict JSON response-shape validation.
-`active.rs` dispatches exhaustively to per-kind state; `active_text.rs` owns message
-parts and reasoning text/summary accounting. Both JSON and SSE ultimately use the same finalization
-state.
+`slot.rs` owns active/completed lifecycle and identity bindings; its private
+`slot/identity.rs` resolves slots without mutation, and `identity.rs` extracts semantic
+identities. `json.rs` owns strict JSON response-shape validation, decoding, and accounting.
+`active.rs` dispatches exhaustively to per-kind state; `active/shell.rs` owns shell-command
+streaming, and `active_text.rs` owns message parts and reasoning text/summary accounting.
+`terminal.rs` owns terminal reconciliation, finalization, and steering cuts. Both JSON
+and SSE use the same finalization state.
 
 Shared `response.content_part.*` events identify an item by output index and item ID,
 not by content type. Normalization parses a typed completed part; the existing slot
@@ -867,6 +1052,19 @@ merge the concrete item with its retained fields and buffers. `slot.rs` dispatch
 to those implementations after validating identity and lifecycle. Finalization
 promotes each completed typed item once and preserves validated output-index order.
 
+`ActiveItem::validate_completion` also reports whether the observed completion
+proves that in-flight work has settled. It uses the item's existing typed status
+and content/identity validation; raw field-presence checks distinguish actual
+fields from serde defaults. `SlotMap::complete` combines that evidence with
+agreement between the submitted completion and the merged item. Its
+`completion_uncertain` flag records inconsistent call IDs, unknown openings or
+recovered snapshots. A steering boundary requires at least one observed slot,
+no active slots and no uncertainty. Lenient done-only recovery without an opening
+continues to ordinary terminal processing rather than authorizing an early cut.
+Steering therefore extends the existing completion transitions and consuming
+finalizer; it has no second parser, completion classifier or output-item hierarchy.
+Only received usage is retained; a cut round may lack terminal usage accounting.
+
 The pipeline's streaming entry is `process_line(ClassifiedSseLine)`. It normalizes and
 validates a data line, applies the event to the slot keyed by its validated output
 index, and returns at most one validated `EventFrame` for translation. For function
@@ -880,7 +1078,8 @@ and completed-item measurement in `executor/response_budget.rs`.
 
 Retained-byte accounting stays in synchronous ingestion. `response_budget.rs` defines
 one comprehensive `RetainedSize` measurement and `RetainedAccount` for charging growth
-and reconciling completed items. Every unbounded collection entry has a structural
+and reconciling completed items. Its private `response_budget/input.rs` implements
+canonical input and accepted-steering measurement through that same trait. Every unbounded collection entry has a structural
 charge, including empty JSON values and web-search queries; unrestricted string fields
 such as message `role` and message content `type` count by length. Bounded enums,
 including reasoning content kinds and item status, need no variable charge. Reasoning
@@ -923,6 +1122,14 @@ depend on SSE or executor types. `TranslationContext` is an owned snapshot of th
 registry facts and request metadata needed for classification and restoration. It
 provides each round's tool classification and owns final restoration of public tool
 declarations, custom/namespace shapes, tool choice, and tool-search metadata.
+
+Async client tools are marked from the same snapshot: the registry's async tool names
+(`ToolRegistry::async_tool_names`) are copied into the context. The dispatcher creates each
+call's translator with its `CallExecution`; for an async call, the function and custom
+translators build the public `output_item.added`/`done` items from the typed accumulated call
+and mark them with `mark_async_call`, which final output normalization also uses on the
+round's call items, before namespace restoration renames them.
+Later stages read the marker from the call item itself.
 
 Gateway-executed types (`Mcp`, `WebSearch`, `FileSearch`, and `CodeInterpreter`) are
 classified as gateway calls by the dispatcher, which suppresses their canonical
@@ -1000,9 +1207,18 @@ and a typed, static client error; it does not alter the process panic hook. On s
 the engine still validates terminal size and persists/publishes the checkpoint before
 yielding completion. Cancellation during storage waits drops the pending persistence
 future through the same owner. WebSocket responses run through the retained owner in
-`engine/retained.rs`, which spawns execution and cancels and joins it explicitly; a
-multi-agent run cancels and joins its rounds through the coordinator's cancellation arm.
+`engine/retained.rs`, which owns prepared response startup and the running task,
+then cancels and joins execution explicitly; a multi-agent run cancels and joins its
+rounds through the coordinator's cancellation arm.
 Their `wait_until_idle` lease fences remain in place.
+
+`executor/response_events.rs` retains the response's sequence owner and bounded
+delivery queue after execution. Typed steering controls can follow terminal events
+without restarting output-item assembly. Its monotonic boundary watch requests a
+safe cut without cancelling started work. Creation receipts, execution outcome and
+actual task joining are separate facts: only sink publication constructs a receipt,
+and only `ResponseRunOwner::join()` marks the producer joined. The adapter uses
+both facts to resolve a successor's accepted input exactly once.
 
 `GatewayStreamAccumulator` carries only cross-round presentation state: monotonic
 `sequence_number`s, public `output_index` rebasing, and deduplication of response start
@@ -1090,9 +1306,9 @@ The round decision remains in `engine.rs`, after gateway execution:
 
 | Decision | Condition and state transition |
 |---|---|
-| `RequiresClientAction` | At least one client-owned call exists. Any gateway calls from the mixed round have already executed; their internal calls/results are recorded before returning. |
-| `Done` | No gateway result and no client-owned call remains. Finalize accumulated output and usage. |
-| `Continue` | Gateway calls ran and round budget remains. Append the upstream output plus gateway results, set `tool_choice: auto`, and infer again. |
+| `RequiresClientAction` | At least one synchronous client-owned call exists. Any gateway calls from the mixed round have already executed; their internal calls/results are recorded before returning. |
+| `Done` | No gateway result and no client-owned call remains, or only async client calls remain on the last permitted round or after two consecutive async-only continuations. Finalize accumulated output and usage; a multi-agent turn finishes with the calls pending. |
+| `Continue` | Gateway calls ran, or the only client calls are async (`ClientCalls`), and round budget remains. Append the upstream output plus gateway results, set `tool_choice: auto`, and infer again; pending async calls stay in the input, and `tool/async_execution.rs` adds a note after each one in the upstream copy. |
 | `Incomplete` | Gateway calls ran on the tenth round. Record the final calls/results and return `status: incomplete` instead of leaving a dangling call. |
 
 `parallel_tool_calls` is an upstream model-generation preference, not a gateway
@@ -1341,6 +1557,16 @@ the operator enables it, and Eryx runtime readiness succeeds.
   code interpreter normalizes to one fixed function contract in every build, while
   request validation rejects unavailable runtimes before upstream inference.
   Feature-enabled builds bind the ready private `CodeInterpreterExecutor` to the provider.
+  `ToolDeclaration::declares_async` and `declares_unsupported_async` answer which
+  declarations make a tool async and which carry `async` where it is not accepted;
+  `GatewayExecutors::validate_declarations` rejects the latter with its declared index.
+- **`async_execution.rs`** — the model-visible hints for async client tools. A vLLM-served
+  model stops at a call, so the gateway continues the response with the call pending.
+  `FunctionHandler`, `CustomHandler`, and `CodexNamespaceHandler` normalization append
+  the background-execution suffix to async tool descriptions, and
+  `RequestPayload::to_upstream_request` calls `lower_async_calls`, which removes the public
+  `async` marker from replayed calls and adds a `developer` note after each pending one.
+  The texts equal the `upstream_hints` fixture, whose effect the recorder's `--sample` runs measured.
 - **`handler.rs`** — the two traits every tool type reasons about:
   ```rust
   pub trait ToolHandler: Send + Sync {
@@ -1502,6 +1728,8 @@ router, reusing the same core logic in-process.
 | Add a new tool type | `tool/handler.rs` impl(s) → `tool/declaration.rs` (a `ToolDeclaration` kind and its view) → `tool/normalize.rs` → `tool/registry.rs` → `executor/translate/client.rs` for client-executed function shapes → `tool/executors.rs` for lazy gateway setup |
 | Change gateway-round concurrency or lifecycle ordering | `executor/gateway.rs` (`GatewayScheduler`/event plans) + `executor/engine.rs` (round decision/ordered streaming) + `tool/ownership.rs` (typed binding and same-tool safety) |
 | Change agent admission, mailbox wakeups or client continuation routing | `executor/engine/multi_agent/` + `executor/multi_agent/`; keep tree persistence in the existing mode handlers |
+| Change single-agent steering admission or handoff | `handler/websocket/responses/control.rs` + `executor/session.rs` + `executor/engine/{execute,retained}.rs`; retain canonical input and publication ownership in core |
+| Change the safe steering boundary | Existing completion validation in `executor/accumulator/{active,slot}.rs` + `executor/pipeline.rs` + `executor/engine/agent_turn.rs`; preserve one ingestion/finalization path and drain started tools |
 | Change client streaming order, buffering, or backpressure | `executor/relay.rs` and `executor/relay/`; keep parsing in `events/` and response assembly in `executor/accumulator/` |
 | Move streaming ingestion to a worker | Benchmark the equivalent inline and worker paths under [#245](https://github.com/vllm-project/agentic-api/issues/245) before changing executor placement |
 | Feed response output into the next inference round | `types/io/output.rs::OutputItem::to_input_item`; use `executor/gateway.rs::append_output_items_to_input` only to append those converted items |
